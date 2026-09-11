@@ -503,25 +503,40 @@ def main():
             time.sleep(5) 
 
             modal_button_clicked = False
+            click_error = ""
             try:
                 sb.click('button:contains("Renew for 4 days")', timeout=8)
                 modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
                 print(f"续期按钮点击失败: {e}")
+                click_error = str(e)[:120].replace("\n", " ")
+                # JS 兜底：选择器点不动（被遮罩挡住/按钮被重渲染）时直接 DOM 派发 click
+                try:
+                    clicked = sb.execute_script(
+                        "for (const b of document.querySelectorAll('button')) {"
+                        " if (b.textContent.includes('Renew for 4 days')) { b.click(); return true; }"
+                        " } return false;"
+                    )
+                    if clicked:
+                        modal_button_clicked = True
+                        print("🧟 JS 兜底点击已发出")
+                except Exception as je:
+                    print(f"❌ JS 兜底点击也失败: {je}")
 
-            print("⏳ 等待后台确认续期（最多 60 秒）...")
+            print("⏳ 等待后台确认续期（最多 90 秒，轮询到期日期/成功提示）...")
             # 原版只等 6 秒，页面/API 未及时刷新便误报“结果未知”。
-            # 轮询页面文字及到期日期；最后再刷新一次，避免读取旧 DOM。
+            # 轮询页面文字及到期日期；最后再整页导航一次，避免读取面板缓存旧值。
             new_page_text = ""
             new_expiry = None
             new_countdown = None
             renewal_confirmed = False
+            toast_hint = ""
             success_markers = (
                 "renewal successful", "renewed successfully", "successfully renewed",
                 "续期成功", "renewed for 4 days", "renew for 4 days"
             )
-            for poll in range(1, 13):
+            for poll in range(1, 19):
                 sb.sleep(5)
                 new_page_text = sb.get_page_source()
                 new_expiry = extract_expiry_date(new_page_text)
@@ -534,12 +549,25 @@ def main():
                     renewal_confirmed = True
                     print(f"✅ 第 {poll} 次检查确认续期已生效")
                     break
-                print(f"⏳ 第 {poll}/12 次检查：页面尚未确认续期")
+                # 顺手抓一次性提示（toast/alert），后台拒绝时能看到原因
+                if not toast_hint:
+                    for sel in ('[role="alert"]', '.toast', '.Toastify',
+                                '[class*="notif"]', '[class*="alert"]', '.swal2-popup'):
+                        try:
+                            if sb.is_element_present(sel):
+                                t = " ".join(sb.get_text(sel).split())
+                                if t and len(t) < 160:
+                                    toast_hint = t
+                                    print(f"💬 页面提示: {t}")
+                                    break
+                        except Exception:
+                            pass
+                print(f"⏳ 第 {poll}/18 次检查：页面尚未确认续期")
 
             if not renewal_confirmed:
-                print("🔄 刷新账单页后作最后一次确认...")
+                print("🔄 重新打开账单页作最后确认（整页导航，绕开面板缓存）...")
                 try:
-                    sb.refresh()
+                    sb.open("https://bot-hosting.net/a/billings")
                     sb.wait_for_ready_state_complete()
                     sb.sleep(5)
                     new_page_text = sb.get_page_source()
@@ -571,10 +599,26 @@ def main():
             else:
                 # 关键修复：不能只发警告后 return 0，否则 Actions 会显示 success。
                 print("❌ 续期未能确认：到期日期/成功提示均未变化")
+                try:
+                    sb.save_screenshot("renew_result_unknown.png")
+                except Exception:
+                    pass
+                # 如实区分：到底点没点到按钮，不能再笼统说“已点击”
+                if modal_button_clicked:
+                    extra = (f"按钮已点击但后台未确认"
+                             f"（{current_expiry or '?'} → {new_expiry or '?'}），"
+                             f"可能续得太早被拒或同账号另一工作流先续了，明日窗口临近会自动重试")
+                else:
+                    extra = (f"弹窗内「Renew for 4 days」按钮没点着"
+                             f"（{click_error or '未知原因'}），需人工检查")
+                if toast_hint:
+                    extra += f"；页面提示: {toast_hint}"
+                if new_countdown:
+                    extra += f"；按钮已转入倒计时 {new_countdown}"
                 send_telegram_message(
                     format_notification(
                         "❌ 续期失败",
-                        extra="按钮已点击但后台未确认，请检查账户或稍后重试",
+                        extra=extra,
                         expiry_date=new_expiry or current_expiry or "（未获取到）"
                     )
                 )
