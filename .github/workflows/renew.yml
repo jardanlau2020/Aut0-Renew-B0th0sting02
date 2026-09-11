@@ -1,8 +1,9 @@
-name: Auto Renew Bot-hosting
+﻿name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '0 1 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+    - cron: '20 1 * * *' # 每日 UTC 01:20 = 北京时间 09:20
+      # 原 0 点整：GitHub schedule 排队高峰常有数小时延迟（实测迟过 4h47m），错开减少延迟。
   workflow_dispatch:
 
 jobs:
@@ -45,6 +46,16 @@ jobs:
         run: |
           xvfb-run --auto-servernum python3 app.py
 
+      - name: 📤 上传截图证据
+        # 失败路径会保存 *.png 诊断截图，没有这一步全部丢失，事后无从回看现场。
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-hosting-screenshots-02
+          path: '*.png'
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
@@ -59,11 +70,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 只保留最近 5 条。原实现 count>1 就删，等于每次只留 1 条 ——
+          # 出问题（例如续期报「结果未知」）时根本回看不了日志。
+          KEEP=5
           runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt $KEEP ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
