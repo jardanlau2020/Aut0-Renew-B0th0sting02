@@ -525,7 +525,21 @@ def main():
             current_title = sb.get_title()
             print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+            # CF 擋截頁兜底：URL 對但 Title 係「Access denied」= Cloudflare 瞬間擋截
+            # （02 run#14 實證），唔係 cookie 問題 —— reload 重試最多 3 次先判死。
+            for _retry in range(3):
+                if "/a/billings" in current_url and "Access denied" not in current_title and "Just a moment" not in current_title:
+                    break
+                print(f"⚠️ 檢測到 CF 擋截/挑戰頁（Title: {current_title}），第 {_retry+1} 次 reload 重試...")
+                sb.sleep(8)
+                sb.open("https://bot-hosting.net/a/billings")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(5)
+                current_url = sb.get_current_url()
+                current_title = sb.get_title()
+                print(f"📝 当前URL: {current_url}, Title: {current_title}")
+
+            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url and "Access denied" not in current_title:
                 login_ok = True
                 print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
             else:
