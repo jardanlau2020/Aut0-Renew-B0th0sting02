@@ -1,4 +1,4 @@
-﻿name: Auto Renew Bot-hosting
+name: Auto Renew Bot-hosting
 
 on:
   schedule:
@@ -43,6 +43,7 @@ jobs:
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ACCOUNT_LABEL: "02"
         run: |
           xvfb-run --auto-servernum python3 app.py
 

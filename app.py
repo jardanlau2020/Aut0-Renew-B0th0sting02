@@ -13,6 +13,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用�
 GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
+ACCOUNT_LABEL = os.environ.get("ACCOUNT_LABEL") or ""   # 帳號標識（如 "01"/"02"），通知用嚟區分多個帳號
 
 # 解析 DISCORD_TOKEN
 DC_TOKEN = ""
@@ -107,8 +108,9 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     else:
         masked_email = EMAIL[:2] + '****' 
     
+    _acct = f" {ACCOUNT_LABEL}" if ACCOUNT_LABEL else ""
     lines = [
-        "🇫🇮 Bot-hosting 续期通知",
+        f"🇫🇮 Bot-hosting{_acct} 续期通知",
         "",
         f"{status}",
         f"👤 登录账户: {masked_email}",
@@ -581,7 +583,6 @@ def main():
             '[class*="renew"]',
             '[class*="Renew"]',
         ]
-
         for selector in possible_selectors:
             try:
                 if sb.is_element_visible(selector):
@@ -782,14 +783,30 @@ def main():
                     )
                 )
             else:
-                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                send_telegram_message(
-                    format_notification(
-                        "ℹ️ 无需续期",
-                        extra="当前状态未知，请手动检查",
-                        expiry_date=current_expiry or "（未获取到）"
+                # 兜底：從 page source 直接提取倒數（run#13 實證：續完後掣會轉做
+                # 倒數計時器，selector get_text 可能因遮擋/渲染 miss —— 唔好直接判「狀態未知」）
+                src = sb.get_page_source()
+                m = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", src)
+                if m:
+                    countdown_text = m.group(1)
+                    friendly = format_countdown(countdown_text)
+                    print(f"⏳ 未到续期时间（兜底提取），倒计时: {countdown_text} ({friendly})")
+                    send_telegram_message(
+                        format_notification(
+                            "⏳ 未到续期时间",
+                            extra=f"⏱️ 可续期时间: {friendly}后",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
                     )
-                )
+                else:
+                    print("ℹ️ 未找到续期按钮或倒计时，状态未知")
+                    send_telegram_message(
+                        format_notification(
+                            "ℹ️ 无需续期",
+                            extra="当前状态未知，请手动检查",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
+                    )
 
         # 更新SESSION_TOKEN 
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
