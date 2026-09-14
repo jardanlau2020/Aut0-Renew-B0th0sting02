@@ -155,6 +155,12 @@ IS_X11 = bool(os.environ.get("DISPLAY"))
 # widget 內部文字在 cross-origin iframe 裡，頂層 get_page_source() 根本看不見，
 # 舊「整頁無 CF 關鍵字」判據因此永遠假陽性 —— captcha 未過就以為過了。
 def _turnstile_solved(sb) -> bool:
+    # v6：probe 開頭先切返頂層 —— driver 停留喺 cross-origin iframe 時
+    # execute_script 唔會 throw，只會靜靜哋搵唔到 token（假陰性）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
     try:
         return bool(sb.execute_script(
             "for (const el of document.querySelectorAll('[name=\"cf-turnstile-response\"]')) {"
@@ -170,40 +176,58 @@ def _turnstile_solved(sb) -> bool:
 # 頁面文案明寫 "Complete the bot check to unlock the button"：
 # 掣未解鎖時 click() 不會報錯，只會被後端忽略 —— 這正是「已點擊但未確認」假失敗的來源。
 def _renew_button_unlocked(sb) -> bool:
+    # v6：probe 開頭先切返頂層（同 _turnstile_solved）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
     try:
         found = sb.execute_script(
-            "let found = false;"
-            "for (const b of document.querySelectorAll('button')) {"
-            "  if (b.textContent.includes('Renew for 4 days')) {"
-            "    found = true;"
+            "const want = 'Renewfor4days';"
+            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
+            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "  if (flat.includes(want)) {"
             "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
             "    return 'unlocked';"
             "  }"
             "}"
-            "return found ? 'unlocked' : 'missing';"
+            "return 'missing';"
         )
         if found == "unlocked":
             return True
         # 掣搵唔到：彈窗可能還沒渲染完，或被遮擋 —— 視為未過，等下一輪
         return False
     except Exception:
+        # v6 自我修復：同 _turnstile_solved —— cross-origin iframe 令 probe
+        # throw 時切返頂層，避免 240 秒全花喺假陰性度。
+        try:
+            sb.switch_to_default_content()
+        except Exception:
+            pass
         return False
 
 
 # 「Renew for 4 days」掣三態（v3 新增）：unlocked / locked / missing。
 # wait_for_turnstile_pass 寬限期結束後用佢判「真無挑戰」定「假陰性」。
 def _renew_button_state(sb) -> str:
+    # v6：probe 開頭先切返頂層（同 _renew_button_unlocked）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
     try:
         return sb.execute_script(
-            "let found = false;"
-            "for (const b of document.querySelectorAll('button')) {"
-            "  if (b.textContent.includes('Renew for 4 days')) {"
-            "    found = true;"
+            "const want = 'Renewfor4days';"
+            "let texts = [];"
+            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
+            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "  if (flat.includes(want)) {"
             "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
             "    return 'unlocked';"
             "  }"
+            "  if (texts.length < 8 && flat) texts.push(flat.slice(0, 24));"
             "}"
-            "return 'missing';"
+            "return 'missing btns=' + texts.join('|');"
         )
     except Exception:
         return "missing"
@@ -351,6 +375,15 @@ def wait_for_turnstile_pass(sb, timeout=60):
     captcha_i = 0
     while time.time() - start < timeout:
         dismiss_consent_popup(sb)
+        # v6 context 防護：uc_gui_click_captcha 內部會 switch_to_frame /
+        # switch_to_window / uc_open_with_disconnect，撳完可以將 driver 留低
+        # 喺 turnstile iframe（cross-origin）或另一個 window 入面 —— 之後所有
+        # execute_script 打喺空白頁，掣/token 永遠探測唔到（run#20「Success!
+        # 但 missing」嘅第二個可能根因）。每次撳之前先切返頂層 document。
+        try:
+            sb.switch_to_default_content()
+        except Exception:
+            pass
         if _turnstile_solved(sb):
             print("✅ Turnstile 驗證已通過")
             sb.save_screenshot("turnstile_passed.png")
@@ -759,6 +792,7 @@ def main():
                 dismiss_consent_popup(sb)
                 try:
                     if IS_X11:
+                        sb.switch_to_default_content()  # v6：同上，防 iframe 跳車
                         sb.uc_gui_click_captcha()  # v4：SB method，非 subprocess
                 except Exception:
                     pass
@@ -775,8 +809,19 @@ def main():
 
             modal_button_clicked = False
             click_error = ""
+            # v6：OCR 實證掣文字在場但 :contains 精確空格匹配唔中（run#20 掣狀態
+            # missing 但截圖明明有掣）—— 掣文字好可能 NBSP／雙空格，或 icon 剝走
+            # 空格（"Renew for" + <icon> + "4 days" → textContent 冇咗個空格）。
+            # XPath translate() 剷走全部空白先匹配，涵蓋 button / a / [role=button]。
             try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
+                _ws = " \t\n\r\u00a0"
+                # XPath 1.0 無 \uXXXX escape —— 空白字符集（含真 NBSP）喺 Python 端構造。
+                sb.click(
+                    '//*[self::button or self::a or @role="button"]'
+                    '[contains(translate(normalize-space(.), "' + _ws + '", ""),'
+                    ' "Renewfor4days")]',
+                    timeout=8,
+                )
                 modal_button_clicked = True
                 print("✅ 已点击续期按钮")
             except Exception as e:
@@ -785,9 +830,11 @@ def main():
                 # JS 兜底：选择器点不动（被遮罩挡住/按钮被重渲染）时直接 DOM 派发 click
                 try:
                     clicked = sb.execute_script(
-                        "for (const b of document.querySelectorAll('button')) {"
-                        " if (b.textContent.includes('Renew for 4 days')) { b.click(); return true; }"
-                        " } return false;"
+                        "const want = 'Renewfor4days';"
+                        "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
+                        "  if (b.textContent.replace(/[^a-zA-Z0-9]/g, '').includes(want)) { b.click(); return true; }"
+                        "}"
+                        "return false;"
                     )
                     if clicked:
                         modal_button_clicked = True
