@@ -128,9 +128,21 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
 
 # 等待Turnstile验证通过
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
+# v4：對齊 SeleniumBase 官方 _on_a_cf_turnstile_page 判據 —— 舊 selector
+# iframe[src*="turnstile"] 匹配唔到 challenge-platform iframe（run#18 DOM dump
+# 4 個無名 iframe 其中一個就係 Turnstile，但 dump 當時無印 src 睇唔出）。
 def _turnstile_iframe_present(sb) -> bool:
     try:
-        return len(sb.find_elements('iframe[src*="turnstile"]')) > 0
+        if len(sb.find_elements('iframe[src*="challenges.cloudflare.com"]')) > 0:
+            return True
+        source = sb.get_page_source()
+        return (
+            'data-callback="onCaptchaSuccess"' in source
+            or "/challenge-platform/h/b/" in source
+            or 'id="challenge-widget-' in source
+            or "challenges.cloudf" in source
+            or "cf-turnstile-" in source
+        )
     except Exception:
         return False
 
@@ -199,11 +211,19 @@ def _renew_button_state(sb) -> str:
 
 # Turnstile widget 容器（iframe 未開時嘅宿主 div）—— iframe 遲 render 場景嘅
 # 第二信號源（run#17 實證 iframe 可以遲過 27s 先出現）。
+# v4 修正：舊 visibility 探測用 offsetParent，但 position:fixed 元素永遠返 null
+# （run#18 DOM dump 全部報 vis=false 但 OCR 實證 checkbox 喺畫面度）——
+# 改用 getClientRects().length > 0（對 fixed 元素一樣準）＋對齊官方 selector。
 def _turnstile_widget_present(sb) -> bool:
     try:
         return bool(sb.execute_script(
-            "for (const el of document.querySelectorAll('[class*=\"turnstile\"],[id*=\"turnstile\"],[data-sitekey]')) {"
-            "  if (el && el.offsetParent !== null) return true;"
+            "for (const el of document.querySelectorAll("
+            "  '[name=\"cf-turnstile-response\"]',"
+            "  '.cf-turnstile-wrapper',"
+            "  '[data-callback=\"onCaptchaSuccess\"]',"
+            "  'iframe[src*=\"challenges.cloudflare.com\"]',"
+            "  'iframe[src*=\"/turnstile/\"]')) {"
+            "  if (el && el.getClientRects().length > 0) return true;"
             "}"
             "return false;"
         ))
@@ -211,13 +231,17 @@ def _turnstile_widget_present(sb) -> bool:
         return False
 
 
-# 診斷 dump：彈窗內 Turnstile 相關 DOM 節點清單（唔掂嗰陣起碼知頁面生咗乜）
+# 診斷 dump：彈窗內 Turnstile 相關 DOM 節點清單（唔掂嗰陣起碼知頁面生咩）
+# v4：補印 iframe src 屬性 + 用 getClientRects 判可見性（offsetParent 對
+# position:fixed 元素永遠 null，run#18 dump 全報 vis=false 係假陰性）。
 def _dump_turnstile_dom(sb) -> None:
     try:
         nodes = sb.execute_script(
             "const out = [];"
             "for (const el of document.querySelectorAll('iframe,[class*=\"turnstile\"],[class*=\"cf\"],[data-sitekey],#onetrust-consent-sdk')) {"
-            "  out.push(el.tagName + '#' + (el.id || '-') + '.' + String(el.className).slice(0,60) + ' vis=' + (el.offsetParent !== null));"
+            "  const vis = el.getClientRects().length > 0;"
+            "  const src = el.src ? ' src=' + el.src.slice(0,80) : '';"
+            "  out.push(el.tagName + '#' + (el.id || '-') + '.' + String(el.className).slice(0,60) + ' vis=' + vis + src);"
             "}"
             "return out.slice(0, 20).join('\\n');"
         )
@@ -319,6 +343,11 @@ def wait_for_turnstile_pass(sb, timeout=60):
 
 
     # Step 2: 見到挑戰 → 撳 captcha，等 token / 掣解鎖（唔超時就重試撳）
+    # v4 根因修復：舊 subprocess 調用 `python -m uc_gui_click_captcha` 個 module
+    # 根本唔存在（run#18 log: No module named uc_gui_click_captcha）——即係
+    # run#17 嗰 8 次撳 captcha 全部冇執行過，capture_output=True 吞晒錯誤。
+    # eooce 原版用嘅係 sb.uc_gui_click_captcha()（SB 內建 method，自己搵
+    # debugger port + widget 座標），對齊返。
     captcha_i = 0
     while time.time() - start < timeout:
         dismiss_consent_popup(sb)
@@ -331,23 +360,14 @@ def wait_for_turnstile_pass(sb, timeout=60):
             return True
         captcha_i += 1
         if IS_X11:
-            # run#17 教訓：capture_output=True 吞晒輸出，8 次即閃即退都唔知原因
-            # —— 改為 tee 出嚟，每次撳完即報狀態
             try:
-                r = subprocess.run(
-                    [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
-                    timeout=40, capture_output=True, text=True,
-                )
-                out = (r.stdout or "").strip()[-200:]
-                err = (r.stderr or "").strip()[-200:]
-                print(f"🖱️ captcha clicker 第 {captcha_i} 次 rc={r.returncode}"
-                      + (f" out: {out}" if out else "")
-                      + (f" err: {err}" if err else ""))
-                if r.returncode != 0 and captcha_i == 3:
+                sb.uc_gui_click_captcha()
+                print(f"🖱️ captcha clicker 第 {captcha_i} 次：已撳出")
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 失败: {str(e)[:150]}")
+                if captcha_i == 3:
                     sb.save_screenshot(f"diag_captcha_fail_{captcha_i}.png")
                     _dump_turnstile_dom(sb)
-            except Exception as e:
-                print(f"⚠️ uc_gui_click_captcha 失败: {e}")
         sb.sleep(5)
 
     print("❌ Turnstile 验证超时未通过")
@@ -729,10 +749,7 @@ def main():
                 dismiss_consent_popup(sb)
                 try:
                     if IS_X11:
-                        subprocess.run(
-                            [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
-                            timeout=40, capture_output=True,
-                        )
+                        sb.uc_gui_click_captcha()  # v4：SB method，非 subprocess
                 except Exception:
                     pass
                 sb.sleep(4)
