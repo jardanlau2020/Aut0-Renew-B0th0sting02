@@ -131,8 +131,22 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
 
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
 def _turnstile_iframe_present(sb) -> bool:
+    # run#22 實證：02 帳號彈窗嘅 turnstile iframe src 冇 "turnstile" 字樣
+    # （匹配唔到 → 12 秒寬限期後誤判「頁面無挑戰」）—— 對齊 v6 五合一 selector。
     try:
-        return len(sb.find_elements('iframe[src*="turnstile"]')) > 0
+        return bool(sb.execute_script(
+            "const sels = ['iframe[src*=\"turnstile\"]',"
+            " 'iframe[src*=\"challenges.cloudflare.com\"]',"
+            " '.cf-turnstile-wrapper',"
+            " '[data-sitekey]',"
+            " '[data-callback=\"onCaptchaSuccess\"]'];"
+            "for (const s of sels) {"
+            "  for (const el of document.querySelectorAll(s)) {"
+            "    if (el.getClientRects().length > 0) return true;"
+            "  }"
+            "}"
+            "return false;"
+        ))
     except Exception:
         return False
 
@@ -180,6 +194,47 @@ def _renew_button_unlocked(sb) -> bool:
         return False
 
 
+# 私隱彈窗（OneTrust / Google CMP）仲咪遮住畫面？
+# Google CMP 嘅 host #fc-consent-root 喺 light DOM 可以直接探測；佢啲掣就藏喺 shadow DOM。
+def _popup_blocking(sb) -> bool:
+    try:
+        return bool(sb.execute_script(
+            "for (const sel of ['#onetrust-banner-sdk', '#onetrust-pc-sdk',"
+            " '#fc-consent-root', '.fc-consent-root']) {"
+            "  const el = document.querySelector(sel);"
+            "  if (el && el.getClientRects().length > 0) return true;"
+            "}"
+            "return false;"
+        ))
+    except Exception:
+        return False
+
+
+# 彈窗/Turnstile DOM 診斷 dump：剷唔走彈窗嗰陣，起碼喺 log 留低現場結構。
+def _dump_popup_dom(sb) -> None:
+    try:
+        info = sb.execute_script(
+            "const out = {iframes: [], roots: [], shadowHosts: []};"
+            "document.querySelectorAll('iframe').forEach(f => {"
+            "  const src = f.src || '';"
+            "  if (src.includes('cloudflare') || src.includes('turnstile')"
+            "    || f.getClientRects().length > 0) out.iframes.push(src.slice(0, 80));"
+            "});"
+            "for (const id of ['onetrust-consent-sdk', 'fc-consent-root']) {"
+            "  const el = document.getElementById(id);"
+            "  if (el) out.roots.push(id + ':vis=' + (el.getClientRects().length > 0)"
+            "    + (el.shadowRoot ? '+shadow' : ''));"
+            "}"
+            "document.querySelectorAll('*').forEach(el => {"
+            "  if (el.shadowRoot) out.shadowHosts.push((el.id || el.className || el.tagName).toString().slice(0, 30));"
+            "});"
+            "return JSON.stringify(out);"
+        )
+        print(f"🔎 彈窗 DOM 診斷: {info}")
+    except Exception as e:
+        print(f"🔎 彈窗 DOM 診斷失敗: {e}")
+
+
 # 關閉 OneTrust / Google CMP 私隱彈窗。
 # 實證（2026-09-13 run#31/32 OCR）：彈窗會疊在 Turnstile 正上方，
 # uc_gui_click_captcha 按座標點擊打在彈窗上，captcha 永遠點不中（間歇性失敗根源）。
@@ -198,6 +253,40 @@ def dismiss_consent_popup(sb) -> bool:
                 return True
         except Exception:
             pass
+    # Google CMP / Funding Choices：個 UI 藏喺 #fc-consent-root 嘅 shadow DOM，
+    # 普通 selector 永遠搵唔到（run#22 OCR 實錘：彈窗蓋住 Turnstile 剷極唔走）。
+    # 遞迴走入所有 shadowRoot 搵掣撳：先 Reject/Do not consent，冇先 Accept。
+    try:
+        clicked = sb.execute_script(
+            "const deepAll = (root, sel) => {"
+            "  const out = [];"
+            "  const walk = (node) => {"
+            "    if (!node || !node.querySelectorAll) return;"
+            "    node.querySelectorAll(sel).forEach(el => out.push(el));"
+            "    node.querySelectorAll('*').forEach(el => { if (el.shadowRoot) walk(el.shadowRoot); });"
+            "  };"
+            "  walk(root);"
+            "  return out;"
+            "};"
+            "const btns = deepAll(document, 'button, [role=button]');"
+            "const prefs = [/do not consent/i, /reject all/i, /reject/i, /accept all/i, /accept/i];"
+            "for (const re of prefs) {"
+            "  for (const b of btns) {"
+            "    const t = ((b.textContent || '') + ' ' + (b.className || '')).trim();"
+            "    if (re.test(t) && b.getClientRects().length > 0) {"
+            "      b.click();"
+            "      return t.slice(0, 40);"
+            "    }"
+            "  }"
+            "}"
+            "return null;"
+        )
+        if clicked:
+            sb.sleep(1)
+            print(f"🍪 已關閉 Google CMP 私隱彈窗（撳咗「{clicked}」）")
+            return True
+    except Exception as e:
+        print(f"⚠️ Google CMP shadow-DOM 撳掣失敗: {e}")
     # 兜底：彈窗還在就移走遮擋（只動 CMP 容器，不碰 Turnstile 本身）
     try:
         removed = sb.execute_script(
@@ -210,6 +299,21 @@ def dismiss_consent_popup(sb) -> bool:
         )
         if removed:
             print(f"🍪 移除了 {removed} 個私隱彈窗容器（DOM 兜底）")
+            return True
+    except Exception:
+        pass
+    # Google CMP 容器兜底：撳唔到掣就直接剷走 host 容器
+    try:
+        removed_fc = sb.execute_script(
+            "let n = 0;"
+            "for (const el of document.querySelectorAll("
+            "  '#fc-consent-root, #fc-consent-root-inner, .fc-consent-root, .fc-dialog-overlay')) {"
+            "  el.remove(); n++;"
+            "}"
+            "return n;"
+        )
+        if removed_fc:
+            print(f"🍪 移除了 {removed_fc} 個 Google CMP 彈窗容器（DOM 兜底）")
             return True
     except Exception:
         pass
@@ -247,7 +351,10 @@ def wait_for_turnstile_pass(sb, timeout=60):
             return True
         sb.sleep(1)
 
-    if not iframe_seen:
+    if not iframe_seen and _popup_blocking(sb):
+        # 彈窗仲遮住畫面 —— 唔可以斷定「無挑戰」，落入 Step 2 繼續剷彈窗+撳 captcha
+        print("⚠️ 私隱彈窗仍在遮擋，無法判定是否有挑戰，繼續剷除重試...")
+    elif not iframe_seen:
         # 全程無 iframe、無 token：真無挑戰
         print("✅ Turnstile 驗證已通過（頁面無挑戰）")
         return True
@@ -275,6 +382,7 @@ def wait_for_turnstile_pass(sb, timeout=60):
         sb.sleep(4)
 
     print("❌ Turnstile 驗證超時未通過")
+    _dump_popup_dom(sb)
     sb.save_screenshot("turnstile_timeout.png")
     return False
     
@@ -646,6 +754,7 @@ def main():
 
                 # 处理弹窗中的 Turnstile
                 print("🔒 检测弹窗中的 Turnstile 验证...")
+                _dump_popup_dom(sb)  # run#22 教訓：留低彈窗現場結構，方便對症落藥
                 # 舊邏輯「先 uc_gui_click_captcha() 再判」打唔中就純粹靠運氣（run#31/32 實證）；
                 # v2 已內建「剷 OneTrust 彈窗 → 撳 captcha → 等 token」重試，直接調用即可。
                 turnstile_passed = wait_for_turnstile_pass(sb, timeout=90)
@@ -675,6 +784,7 @@ def main():
                     unlock_wait += 4
                 if not _renew_button_unlocked(sb):
                     print("❌ 续期按钮仍处于锁定状态（bot check 未通过），放弃点击")
+                    _dump_popup_dom(sb)
                     sb.save_screenshot("button_still_locked.png")
                     send_telegram_message(format_notification(
                         "❌ 续期失败", error="Bot check 未通过，按钮仍锁定"))
