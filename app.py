@@ -131,8 +131,8 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
 
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
 def _turnstile_iframe_present(sb) -> bool:
-    # run#22 實證：02 帳號彈窗嘅 turnstile iframe src 冇 "turnstile" 字樣
-    # （匹配唔到 → 12 秒寬限期後誤判「頁面無挑戰」）—— 對齊 v6 五合一 selector。
+    # 五合一偵測（run#22/23 實證：02 帳號個 turnstile iframe src 冇明顯
+    # turnstile 字樣，淨係 iframe[src*=turnstile] 匹配唔到 → 誤判無挑戰）
     try:
         return bool(sb.execute_script(
             "const sels = ['iframe[src*=\"turnstile\"]',"
@@ -159,6 +159,12 @@ IS_X11 = bool(os.environ.get("DISPLAY"))
 # widget 內部文字在 cross-origin iframe 裡，頂層 get_page_source() 根本看不見，
 # 舊「整頁無 CF 關鍵字」判據因此永遠假陽性 —— captcha 未過就以為過了。
 def _turnstile_solved(sb) -> bool:
+    # probe 開頭先切返頂層 —— driver 停留喺 cross-origin iframe 時
+    # execute_script 唔會 throw，只會靜靜哋搵唔到 token（假陰性）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
     try:
         return bool(sb.execute_script(
             "for (const el of document.querySelectorAll('[name=\"cf-turnstile-response\"]')) {"
@@ -174,24 +180,95 @@ def _turnstile_solved(sb) -> bool:
 # 頁面文案明寫 "Complete the bot check to unlock the button"：
 # 掣未解鎖時 click() 不會報錯，只會被後端忽略 —— 這正是「已點擊但未確認」假失敗的來源。
 def _renew_button_unlocked(sb) -> bool:
+    # probe 開頭先切返頂層（同 _turnstile_solved）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
     try:
         found = sb.execute_script(
-            "let found = false;"
-            "for (const b of document.querySelectorAll('button')) {"
-            "  if (b.textContent.includes('Renew for 4 days')) {"
-            "    found = true;"
+            "const want = 'Renewfor4days';"
+            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
+            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "  if (flat.includes(want)) {"
             "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
             "    return 'unlocked';"
             "  }"
             "}"
-            "return found ? 'unlocked' : 'missing';"
+            "return 'missing';"
         )
         if found == "unlocked":
             return True
         # 掣搵唔到：彈窗可能還沒渲染完，或被遮擋 —— 視為未過，等下一輪
         return False
     except Exception:
+        try:
+            sb.switch_to_default_content()
+        except Exception:
+            pass
         return False
+
+
+# 「Renew for 4 days」掣三態（unlocked / locked / missing）。
+# wait_for_turnstile_pass 寬限期結束後用佢判「真無挑戰」定「假陰性」。
+def _renew_button_state(sb) -> str:
+    # probe 開頭先切返頂層（同 _renew_button_unlocked）。
+    try:
+        sb.switch_to_default_content()
+    except Exception:
+        pass
+    try:
+        return sb.execute_script(
+            "const want = 'Renewfor4days';"
+            "let texts = [];"
+            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
+            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "  if (flat.includes(want)) {"
+            "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
+            "    return 'unlocked';"
+            "  }"
+            "  if (texts.length < 8 && flat) texts.push(flat.slice(0, 24));"
+            "}"
+            "return 'missing btns=' + texts.join('|');"
+        )
+    except Exception:
+        return "missing"
+
+
+# Turnstile widget 容器（iframe 未開時嘅宿主 div）—— iframe 遲 render 場景嘅
+# 第二信號源（run#17 實證 iframe 可以遲過 27s 先出現）。
+def _turnstile_widget_present(sb) -> bool:
+    try:
+        return bool(sb.execute_script(
+            "for (const el of document.querySelectorAll("
+            "  '[name=\"cf-turnstile-response\"]',"
+            "  '.cf-turnstile-wrapper',"
+            "  '[data-callback=\"onCaptchaSuccess\"]',"
+            "  'iframe[src*=\"challenges.cloudflare.com\"]',"
+            "  'iframe[src*=\"/turnstile/\"]')) {"
+            "  if (el && el.getClientRects().length > 0) return true;"
+            "}"
+            "return false;"
+        ))
+    except Exception:
+        return False
+
+
+# 診斷 dump：彈窗內 Turnstile 相關 DOM 節點清單（唔掂嗰陣起碼知頁面生咩）
+def _dump_turnstile_dom(sb) -> None:
+    try:
+        nodes = sb.execute_script(
+            "const out = [];"
+            "for (const el of document.querySelectorAll('iframe,[class*=\"turnstile\"],[class*=\"cf\"],[data-sitekey],#onetrust-consent-sdk')) {"
+            "  const vis = el.getClientRects().length > 0;"
+            "  const src = el.src ? ' src=' + el.src.slice(0,80) : '';"
+            "  out.push(el.tagName + '#' + (el.id || '-') + '.' + String(el.className).slice(0,60) + ' vis=' + vis + src);"
+            "}"
+            "return out.slice(0, 20).join('\\n');"
+        )
+        print(f"🧬 Turnstile DOM 快照:\n{nodes or '(無相關節點)'}")
+    except Exception as e:
+        print(f"🧬 DOM dump 失败: {e}")
 
 
 # 私隱彈窗（OneTrust / Google CMP）仲咪遮住畫面？
@@ -336,53 +413,90 @@ def wait_for_turnstile_pass(sb, timeout=60):
     """
     start = time.time()
 
-    # Step 1: 寬限期等 widget 出現（最多 12 秒），期間先剷走私隱彈窗免遮擋
+    # Step 1: 寬限期等 widget 出現（run#17 實證：芬蘭代理下 iframe 可遲過 27s
+    # 先 render，12s grace 會假陰性「頁面無挑戰」→ 掣永遠鎖死）。
+    # 每輪先剷走私隱彈窗；寬限期內每逢第 5 輪 dump 一次現場。
     iframe_seen = False
-    grace = min(12, timeout)
+    grace = min(25, timeout)
+    diag_i = 0
     while time.time() - start < grace:
         dismiss_consent_popup(sb)
-        if _turnstile_iframe_present(sb):
+        if _turnstile_iframe_present(sb) or _turnstile_widget_present(sb):
             iframe_seen = True
-            print("🔍 Turnstile iframe 已出現，等待解決...")
+            print("🔍 Turnstile 挑戰已出現（iframe/widget 容器）...")
             break
         if _turnstile_solved(sb):
             # widget 未見但 token 已有（invisible 模式）—— 直接算過
             print("✅ Turnstile 驗證已通過（token 已存在）")
             return True
+        if diag_i % 5 == 4:
+            sb.save_screenshot(f"diag_grace_{diag_i}.png")
+            _dump_turnstile_dom(sb)
+        diag_i += 1
         sb.sleep(1)
 
-    if not iframe_seen and _popup_blocking(sb):
-        # 彈窗仲遮住畫面 —— 唔可以斷定「無挑戰」，落入 Step 2 繼續剷彈窗+撳 captcha
-        print("⚠️ 私隱彈窗仍在遮擋，無法判定是否有挑戰，繼續剷除重試...")
-    elif not iframe_seen:
-        # 全程無 iframe、無 token：真無挑戰
-        print("✅ Turnstile 驗證已通過（頁面無挑戰）")
-        return True
+    if not iframe_seen:
+        btn = _renew_button_state(sb)
+        if btn == "unlocked":
+            # 無 widget 而掣已解鎖 —— 真無挑戰（或已通過）
+            print("✅ Turnstile 驗證已通過（掣已解鎖，無需挑戰）")
+            return True
+        if btn == "locked":
+            # 掣鎖住 = 頁面明寫有 bot check —— widget render 慢唔等於冇挑戰
+            # （run#17/23 教訓：假陰性判「無挑戰」→ 掣永遠鎖死）→ 硬等
+            iframe_seen = True
+            print("⚠️ 寬限期未見 widget，但掣鎖住 → 判定挑戰存在，硬等")
+        else:
+            sb.save_screenshot("diag_no_button_no_widget.png")
+            _dump_turnstile_dom(sb)
+            print("⚠️ 未見 widget 亦未見掣 —— 彈窗可能未開，繼續硬等 render")
+            iframe_seen = True
 
-    # Step 2: 見到 iframe → 撳 captcha，等 token（唔超時就重試撳）
+    # Step 2: 見到挑戰 → 撳 captcha，等 token / 掣解鎖（唔超時就重試撳）
+    # clicker 用 SB 內建 sb.uc_gui_click_captcha()（自己搵 debugger port + widget
+    # 座標）—— v4 run#18 實證 `python -m uc_gui_click_captcha` module 根本唔存在，
+    # capture_output 吞晒錯誤靜默失敗；01 倉 subprocess 寫法同理從未真正撳過。
+    captcha_i = 0
     while time.time() - start < timeout:
         dismiss_consent_popup(sb)
+        # context 防護：clicker 撳完可以將 driver 留低喺 turnstile iframe
+        # （cross-origin）入面 —— 之後所有 execute_script 打喺錯誤頁面。
+        # 每次撳之前先切返頂層 document。
+        try:
+            sb.switch_to_default_content()
+        except Exception:
+            pass
         if _turnstile_solved(sb):
             press_time = time.time()
             print(f"✅ Turnstile 驗證已通過（耗時 {press_time - start:.0f}s）")
             sb.save_screenshot("turnstile_passed.png")
             return True
-        try:
-            if IS_X11:
-                subprocess.run(
-                    [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
-                    timeout=40, capture_output=True,
-                )
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 失败: {e}")
-        # 掣未解鎖（bot check 未過）就唔好撳掣——撳咗也白撳，後台唔會受理
         if _renew_button_unlocked(sb):
-            print("🔓 Renew 按鈕已解鎖")
+            print("🔓 Renew 按鈕已解鎖（bot check 已通過）")
             return True
-        sb.sleep(4)
+        captcha_i += 1
+        if IS_X11:
+            try:
+                sb.uc_gui_click_captcha()
+                print(f"🖱️ captcha clicker 第 {captcha_i} 次：已撳出")
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 失败: {str(e)[:150]}")
+                if captcha_i % 3 == 0:
+                    sb.save_screenshot(f"diag_captcha_fail_{captcha_i}.png")
+                    _dump_turnstile_dom(sb)
+        sb.sleep(5)
 
-    print("❌ Turnstile 驗證超時未通過")
+    # 最後機會輪詢：run#19 實證——clicker 撳中咗 captcha（截圖 Success!），
+    # 但 token／掣解鎖喺超時後幾秒先反映到 DOM，超時即跳太早。多等 15s 補救。
+    for _lastchance in range(5):
+        if _turnstile_solved(sb) or _renew_button_unlocked(sb):
+            print("✅ Turnstile 驗證已通過（最後機會輪詢）")
+            return True
+        sb.sleep(3)
+
+    print(f"❌ Turnstile 验证超时未通过（掣狀態: {_renew_button_state(sb)}）")
     _dump_popup_dom(sb)
+    _dump_turnstile_dom(sb)
     sb.save_screenshot("turnstile_timeout.png")
     return False
     
@@ -757,7 +871,7 @@ def main():
                 _dump_popup_dom(sb)  # run#22 教訓：留低彈窗現場結構，方便對症落藥
                 # 舊邏輯「先 uc_gui_click_captcha() 再判」打唔中就純粹靠運氣（run#31/32 實證）；
                 # v2 已內建「剷 OneTrust 彈窗 → 撳 captcha → 等 token」重試，直接調用即可。
-                turnstile_passed = wait_for_turnstile_pass(sb, timeout=90)
+                turnstile_passed = wait_for_turnstile_pass(sb, timeout=240)
 
                 if not turnstile_passed:
                     print("❌ Turnstile 验证最终未通过，脚本退出")
@@ -772,14 +886,17 @@ def main():
                 unlock_wait = 0
                 while not _renew_button_unlocked(sb) and unlock_wait < 30:
                     dismiss_consent_popup(sb)
+                    # v4/v6 實證：subprocess `python -m uc_gui_click_captcha` module
+                    # 唔存在（run#18 No module named）—— SB 內建 method 先啱。
                     try:
-                        if IS_X11:
-                            subprocess.run(
-                                [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
-                                timeout=40, capture_output=True,
-                            )
+                        sb.switch_to_default_content()
                     except Exception:
                         pass
+                    if IS_X11:
+                        try:
+                            sb.uc_gui_click_captcha()
+                        except Exception:
+                            pass
                     sb.sleep(4)
                     unlock_wait += 4
                 if not _renew_button_unlocked(sb):
