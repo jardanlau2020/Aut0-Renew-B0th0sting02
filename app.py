@@ -178,6 +178,54 @@ def _renew_button_unlocked(sb) -> bool:
         return False
 
 
+# 「Renew for 4 days」掣三態（v3 新增）：unlocked / locked / missing。
+# wait_for_turnstile_pass 寬限期結束後用佢判「真無挑戰」定「假陰性」。
+def _renew_button_state(sb) -> str:
+    try:
+        return sb.execute_script(
+            "let found = false;"
+            "for (const b of document.querySelectorAll('button')) {"
+            "  if (b.textContent.includes('Renew for 4 days')) {"
+            "    found = true;"
+            "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
+            "    return 'unlocked';"
+            "  }"
+            "}"
+            "return 'missing';"
+        )
+    except Exception:
+        return "missing"
+
+
+# Turnstile widget 容器（iframe 未開時嘅宿主 div）—— iframe 遲 render 場景嘅
+# 第二信號源（run#17 實證 iframe 可以遲過 27s 先出現）。
+def _turnstile_widget_present(sb) -> bool:
+    try:
+        return bool(sb.execute_script(
+            "for (const el of document.querySelectorAll('[class*=\"turnstile\"],[id*=\"turnstile\"],[data-sitekey]')) {"
+            "  if (el && el.offsetParent !== null) return true;"
+            "}"
+            "return false;"
+        ))
+    except Exception:
+        return False
+
+
+# 診斷 dump：彈窗內 Turnstile 相關 DOM 節點清單（唔掂嗰陣起碼知頁面生咗乜）
+def _dump_turnstile_dom(sb) -> None:
+    try:
+        nodes = sb.execute_script(
+            "const out = [];"
+            "for (const el of document.querySelectorAll('iframe,[class*=\"turnstile\"],[class*=\"cf\"],[data-sitekey],#onetrust-consent-sdk')) {"
+            "  out.push(el.tagName + '#' + (el.id || '-') + '.' + String(el.className).slice(0,60) + ' vis=' + (el.offsetParent !== null));"
+            "}"
+            "return out.slice(0, 20).join('\\n');"
+        )
+        print(f"🧬 Turnstile DOM 快照:\n{nodes or '(無相關節點)'}")
+    except Exception as e:
+        print(f"🧬 DOM dump 失败: {e}")
+
+
 # 關閉 OneTrust / Google CMP 私隱彈窗。
 # 實證（2026-09-13 run#31/32 OCR）：彈窗會疊在 Turnstile 正上方，
 # uc_gui_click_captcha 按座標點擊打在彈窗上，captcha 永遠點不中（間歇性失敗根源）。
@@ -228,46 +276,79 @@ def wait_for_turnstile_pass(sb, timeout=60):
     """
     start = time.time()
 
-    # Step 1: 寬限期等 widget 出現（最多 12 秒），期間先剷走私隱彈窗免遮擋
+    # Step 1: 寬限期等 widget 出現（run#17 實證：芬蘭代理下 iframe 可遲過 27s
+    # 先 render，12s grace 會假陰性「頁面無挑戰」→ 掣永遠鎖死）。
+    # 修正：寬限期內每 5s dump 一次現場（screenshot + DOM 節點清單），
+    # 而且只要「Renew for 4 days」掣存在且鎖住 → 必有 bot check，唔准判 absent。
     iframe_seen = False
-    grace = min(12, timeout)
+    grace = min(25, timeout)
+    diag_i = 0
     while time.time() - start < grace:
         dismiss_consent_popup(sb)
-        if _turnstile_iframe_present(sb):
+        if _turnstile_iframe_present(sb) or _turnstile_widget_present(sb):
             iframe_seen = True
-            print("🔍 Turnstile iframe 已出現，等待解決...")
+            print("🔍 Turnstile 挑戰已出現（iframe/widget 容器）...")
             break
         if _turnstile_solved(sb):
             # widget 未見但 token 已有（invisible 模式）—— 直接算過
             print("✅ Turnstile 驗證已通過（token 已存在）")
             return True
+        if diag_i % 5 == 4:
+            sb.save_screenshot(f"diag_grace_{diag_i}.png")
+            _dump_turnstile_dom(sb)
+        diag_i += 1
         sb.sleep(1)
 
     if not iframe_seen:
-        # 全程無 iframe、無 token：真無挑戰
-        print("✅ Turnstile 驗證已通過（頁面無挑戰）")
-        return True
+        btn = _renew_button_state(sb)
+        if btn == "unlocked":
+            # 無 widget 而掣已解鎖 —— 真無挑戰（或已通過）
+            print("✅ Turnstile 驗證已通過（掣已解鎖，無需挑戰）")
+            return True
+        if btn == "locked":
+            # 掣鎖住 = 頁面明寫有 bot check —— 假陰性修復（run#17 教訓）：
+            # widget render 慢唔等於冇挑戰，硬等，絕不判「頁面無挑戰」
+            iframe_seen = True
+            print("⚠️ 寬限期未見 widget，但掣鎖住 → 判定挑戰存在，硬等")
+        else:
+            sb.save_screenshot("diag_no_button_no_widget.png")
+            _dump_turnstile_dom(sb)
+            print("⚠️ 未見 widget 亦未見掣 —— 彈窗可能未開，繼續硬等 render")
+            iframe_seen = True
 
-    # Step 2: 見到 iframe → 撳 captcha，等 token（唔超時就重試撳）
+
+
+    # Step 2: 見到挑戰 → 撳 captcha，等 token / 掣解鎖（唔超時就重試撳）
+    captcha_i = 0
     while time.time() - start < timeout:
         dismiss_consent_popup(sb)
         if _turnstile_solved(sb):
             print("✅ Turnstile 驗證已通過")
             sb.save_screenshot("turnstile_passed.png")
             return True
-        try:
-            if IS_X11:
-                subprocess.run(
-                    [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
-                    timeout=40, capture_output=True,
-                )
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 失败: {e}")
-        # 掣未解鎖（bot check 未過）就唔好撳掣——撳咗也白撳，後台唔會受理
         if _renew_button_unlocked(sb):
-            print("🔓 Renew 按鈕已解鎖")
+            print("🔓 Renew 按鈕已解鎖（bot check 已通過）")
             return True
-        sb.sleep(4)
+        captcha_i += 1
+        if IS_X11:
+            # run#17 教訓：capture_output=True 吞晒輸出，8 次即閃即退都唔知原因
+            # —— 改為 tee 出嚟，每次撳完即報狀態
+            try:
+                r = subprocess.run(
+                    [sys.executable, "-m", "uc_gui_click_captcha", "--override", "127.0.0.1:9223"],
+                    timeout=40, capture_output=True, text=True,
+                )
+                out = (r.stdout or "").strip()[-200:]
+                err = (r.stderr or "").strip()[-200:]
+                print(f"🖱️ captcha clicker 第 {captcha_i} 次 rc={r.returncode}"
+                      + (f" out: {out}" if out else "")
+                      + (f" err: {err}" if err else ""))
+                if r.returncode != 0 and captcha_i == 3:
+                    sb.save_screenshot(f"diag_captcha_fail_{captcha_i}.png")
+                    _dump_turnstile_dom(sb)
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 失败: {e}")
+        sb.sleep(5)
 
     print("❌ Turnstile 验证超时未通过")
     sb.save_screenshot("turnstile_timeout.png")
@@ -641,8 +722,10 @@ def main():
             print("⏳ 等待续期按钮可用并点击...")
             # 撳掣前鐵證確認：bot check 未過（掣鎖住）就撳，後台一定唔受理，
             # 90 秒輪詢必然等唔到 →「已點擊但未確認」假失敗（run#31/32 教訓）。
+            # run#17 教訓：芬蘭代理下 widget 27s 先 render，30s 窗口 8 次撳掣全
+            # 打喺 OneTrust 彈窗上就時間到了 —— 擴到 120s 俾足 render＋重撳空間。
             unlock_wait = 0
-            while not _renew_button_unlocked(sb) and unlock_wait < 30:
+            while not _renew_button_unlocked(sb) and unlock_wait < 120:
                 dismiss_consent_popup(sb)
                 try:
                     if IS_X11:
