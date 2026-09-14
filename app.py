@@ -370,7 +370,16 @@ def wait_for_turnstile_pass(sb, timeout=60):
                     _dump_turnstile_dom(sb)
         sb.sleep(5)
 
-    print("❌ Turnstile 验证超时未通过")
+    # 最後機會輪詢：run#19 實證——clicker 撳中咗 captcha（截圖 Success!），
+    # 但 token／掣解鎖喺超時後幾秒先反映到 DOM，90s 上限跳車跳得太早。
+    # 超時後再多等 15s，每 3s 掂一次，唔好臨門一腳失手。
+    for _lastchance in range(5):
+        if _turnstile_solved(sb) or _renew_button_unlocked(sb):
+            print("✅ Turnstile 驗證已通過（最後機會輪詢）")
+            return True
+        sb.sleep(3)
+
+    print(f"❌ Turnstile 验证超时未通过（掣狀態: {_renew_button_state(sb)}）")
     sb.save_screenshot("turnstile_timeout.png")
     return False
     
@@ -728,9 +737,10 @@ def main():
 
             # 处理弹窗中的 Turnstile
             print("🔒 检测弹窗中的 Turnstile 验证...")
-            # 舊邏輯「先 uc_gui_click_captcha() 再判」打唔中就純粹靠運氣（run#31/32 實證）；
             # v2 已內建「剷 OneTrust 彈窗 → 撳 captcha → 等 token」重試，直接調用即可。
-            turnstile_passed = wait_for_turnstile_pass(sb, timeout=90)
+            # run#19 實證 clicker 要撳 ~5 次先中（每次 ~23s 含 pyautogui 開銷），
+            # timeout 90s 唔夠撳 → 240s 俾足重試空間。
+            turnstile_passed = wait_for_turnstile_pass(sb, timeout=240)
 
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
