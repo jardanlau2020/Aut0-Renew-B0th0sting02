@@ -165,12 +165,27 @@ def _turnstile_solved(sb) -> bool:
         sb.switch_to_default_content()
     except Exception:
         pass
+    # run#25 實錘：02 帳號成個 modal（連 turnstile token input）藏喺
+    # shadow DOM（DOM dump 見兩個 DIV shadow hosts，light DOM probe 全滅）
+    # —— 遞迴行入晒所有 shadowRoot 搵 token。
     try:
         return bool(sb.execute_script(
-            "for (const el of document.querySelectorAll('[name=\"cf-turnstile-response\"]')) {"
-            "  if (el.value && el.value.length > 20) return true;"
-            "}"
-            "return false;"
+            "return (() => {"
+            "const deepSel = (root, sel) => {"
+            "  const walk = (node) => {"
+            "    if (!node || !node.querySelectorAll) return null;"
+            "    for (const el of node.querySelectorAll(sel)) {"
+            "      if (el.value && el.value.length > 20) return el;"
+            "    }"
+            "    for (const el of node.querySelectorAll('*')) {"
+            "      if (el.shadowRoot) { const hit = walk(el.shadowRoot); if (hit) return hit; }"
+            "    }"
+            "    return null;"
+            "  };"
+            "  return walk(root);"
+            "};"
+            "return !!deepSel(document, '[name=\"cf-turnstile-response\"]');"
+            "})();"
         ))
     except Exception:
         return False
@@ -185,17 +200,27 @@ def _renew_button_unlocked(sb) -> bool:
         sb.switch_to_default_content()
     except Exception:
         pass
+    # shadow-DOM 探測（run#25：OCR 見到掣但 light DOM 返 missing）
     try:
         found = sb.execute_script(
+            "return (() => {"
             "const want = 'Renewfor4days';"
-            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
-            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
-            "  if (flat.includes(want)) {"
-            "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
-            "    return 'unlocked';"
+            "const walk = (node) => {"
+            "  if (!node || !node.querySelectorAll) return 'missing';"
+            "  for (const b of node.querySelectorAll('button, [role=\"button\"], a')) {"
+            "    const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "    if (flat.includes(want)) {"
+            "      if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
+            "      return 'unlocked';"
+            "    }"
             "  }"
-            "}"
-            "return 'missing';"
+            "  for (const el of node.querySelectorAll('*')) {"
+            "    if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r !== 'missing') return r; }"
+            "  }"
+            "  return 'missing';"
+            "};"
+            "return walk(document);"
+            "})();"
         )
         if found == "unlocked":
             return True
@@ -219,17 +244,26 @@ def _renew_button_state(sb) -> str:
         pass
     try:
         return sb.execute_script(
+            "return (() => {"
             "const want = 'Renewfor4days';"
             "let texts = [];"
-            "for (const b of document.querySelectorAll('button, [role=\"button\"], a')) {"
-            "  const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
-            "  if (flat.includes(want)) {"
-            "    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
-            "    return 'unlocked';"
+            "const walk = (node) => {"
+            "  if (!node || !node.querySelectorAll) return 'missing';"
+            "  for (const b of node.querySelectorAll('button, [role=\"button\"], a')) {"
+            "    const flat = b.textContent.replace(/[^a-zA-Z0-9]/g, '');"
+            "    if (flat.includes(want)) {"
+            "      if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'locked';"
+            "      return 'unlocked';"
+            "    }"
+            "    if (texts.length < 8 && flat) texts.push(flat.slice(0, 24));"
             "  }"
-            "  if (texts.length < 8 && flat) texts.push(flat.slice(0, 24));"
-            "}"
-            "return 'missing btns=' + texts.join('|');"
+            "  for (const el of node.querySelectorAll('*')) {"
+            "    if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r !== 'missing') return r; }"
+            "  }"
+            "  return 'missing btns=' + texts.join('|');"
+            "};"
+            "return walk(document);"
+            "})();"
         )
     except Exception:
         return "missing"
@@ -275,13 +309,18 @@ def _dump_turnstile_dom(sb) -> None:
 # Google CMP 嘅 host #fc-consent-root 喺 light DOM 可以直接探測；佢啲掣就藏喺 shadow DOM。
 def _popup_blocking(sb) -> bool:
     try:
+        # IIFE wrap：clicker 嘅 disconnect/reconnect cycle 之後，CDP
+        # Runtime.evaluate 可以進入非 wrap 模式，頂層 return 會 SyntaxError
+        # （run#25 實錘 27 次連環失敗）—— 全部 script 用 (()=>{...})() 包死。
         return bool(sb.execute_script(
-            "for (const sel of ['#onetrust-banner-sdk', '#onetrust-pc-sdk',"
-            " '#fc-consent-root', '.fc-consent-root']) {"
-            "  const el = document.querySelector(sel);"
-            "  if (el && el.getClientRects().length > 0) return true;"
-            "}"
-            "return false;"
+            "return (() => {"
+            "  for (const sel of ['#onetrust-banner-sdk', '#onetrust-pc-sdk',"
+            "   ' #fc-consent-root', '.fc-consent-root']) {"
+            "    const el = document.querySelector(sel);"
+            "    if (el && el.getClientRects().length > 0) return true;"
+            "  }"
+            "  return false;"
+            "})();"
         ))
     except Exception:
         return False
@@ -291,6 +330,7 @@ def _popup_blocking(sb) -> bool:
 def _dump_popup_dom(sb) -> None:
     try:
         info = sb.execute_script(
+            "return (() => {"
             "const out = {iframes: [], roots: [], shadowHosts: []};"
             "document.querySelectorAll('iframe').forEach(f => {"
             "  const src = f.src || '';"
@@ -306,6 +346,7 @@ def _dump_popup_dom(sb) -> None:
             "  if (el.shadowRoot) out.shadowHosts.push((el.id || el.className || el.tagName).toString().slice(0, 30));"
             "});"
             "return JSON.stringify(out);"
+            "})();"
         )
         print(f"🔎 彈窗 DOM 診斷: {info}")
     except Exception as e:
@@ -333,8 +374,12 @@ def dismiss_consent_popup(sb) -> bool:
     # Google CMP / Funding Choices：個 UI 藏喺 #fc-consent-root 嘅 shadow DOM，
     # 普通 selector 永遠搵唔到（run#22 OCR 實錘：彈窗蓋住 Turnstile 剷極唔走）。
     # 遞迴走入所有 shadowRoot 搵掣撳：先 Reject/Do not consent，冇先 Accept。
+    # IIFE wrap 必須（run#25 實錘）：clicker 嘅 disconnect/reconnect cycle 後，
+    # CDP evaluate 進入非 wrap 模式，頂層 return → SyntaxError: Illegal return
+    # statement —— 27 次連環失敗，掣其實一次都冇撳過，彈窗返嚟遮住 captcha。
     try:
         clicked = sb.execute_script(
+            "return (() => {"
             "const deepAll = (root, sel) => {"
             "  const out = [];"
             "  const walk = (node) => {"
@@ -357,6 +402,7 @@ def dismiss_consent_popup(sb) -> bool:
             "  }"
             "}"
             "return null;"
+            "})();"
         )
         if clicked:
             sb.sleep(1)
@@ -367,12 +413,14 @@ def dismiss_consent_popup(sb) -> bool:
     # 兜底：彈窗還在就移走遮擋（只動 CMP 容器，不碰 Turnstile 本身）
     try:
         removed = sb.execute_script(
+            "return (() => {"
             "let n = 0;"
             "for (const id of ['onetrust-consent-sdk','onetrust-banner-sdk','onetrust-pc-sdk']) {"
             "  const el = document.getElementById(id);"
             "  if (el) { el.remove(); n++; }"
             "}"
             "return n;"
+            "})();"
         )
         if removed:
             print(f"🍪 移除了 {removed} 個私隱彈窗容器（DOM 兜底）")
@@ -382,12 +430,14 @@ def dismiss_consent_popup(sb) -> bool:
     # Google CMP 容器兜底：撳唔到掣就直接剷走 host 容器
     try:
         removed_fc = sb.execute_script(
+            "return (() => {"
             "let n = 0;"
             "for (const el of document.querySelectorAll("
             "  '#fc-consent-root, #fc-consent-root-inner, .fc-consent-root, .fc-dialog-overlay')) {"
             "  el.remove(); n++;"
             "}"
             "return n;"
+            "})();"
         )
         if removed_fc:
             print(f"🍪 移除了 {removed_fc} 個 Google CMP 彈窗容器（DOM 兜底）")
