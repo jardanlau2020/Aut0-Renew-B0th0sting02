@@ -50,7 +50,7 @@ jobs:
       - name: 📤 上传截图证据
         # 失败路径会保存 *.png 诊断截图，没有这一步全部丢失，事后无从回看现场。
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bot-hosting-screenshots-02
           path: '*.png'
