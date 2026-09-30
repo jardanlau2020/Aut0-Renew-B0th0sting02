@@ -98,35 +98,84 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"❌ Telegram 发送失败: {e}")
 
-# 通知格式
-def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+# 通知格式（瘦身版：表頭一行 + 帳號一行，純文本無 HTML 標籤）
+def now_local() -> str:
+    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def clip_text(text, limit: int) -> str:
+    """壓平空白並截短（超出用 … 收尾），避免通知爆行"""
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def fmt_expiry(value) -> str:
+    """到期日期 → MM-DD HH:MM 或 MM-DD（兼容 / 與 - 分隔；攞唔到回空字串）"""
+    t = str(value or "").strip()
+    if not t:
+        return ""
+    m = re.match(r"(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2})", t)
+    if m:
+        return f"{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}"
+    m = re.match(r"(\d{4})[-/](\d{2})[-/](\d{2})", t)
+    if m:
+        return f"{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def masked_email() -> str:
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
+            return f"{name[:2]}****{name[-2:]}@{domain}"
+        return f"{name}@{domain}"
+    return (EMAIL[:2] + '****') if EMAIL else ""
+
+
+def account_label() -> str:
+    """通知用嘅帳號標識：ACCOUNT_LABEL 優先，補埋遮罩郵箱"""
+    parts = [p for p in (ACCOUNT_LABEL.strip(), masked_email()) if p]
+    return " ".join(parts) or "帳號"
+
+
+def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
+    """瘦身兩行格式：
+    表頭「🎮 服務 ｜ MM-DD HH:MM ｜ ✅ n ｜ ⏭️ n ｜ ❌ n」＋ 「▪️ 帳號 · 短狀態 · 關鍵數字」。
+    成功只留結果與到期時間；失敗保留原因（截短 60 字）；需要人手介入才加提示行。
+    """
+    ok = status.startswith("✅")
+    bad = status.startswith("❌")
+    n_ok, n_skip, n_bad = (1, 0, 0) if ok else ((0, 0, 1) if bad else (0, 1, 0))
+    exp = fmt_expiry(expiry_date)
+    lines = ["🎮 Bot-hosting 續期 ｜ {} ｜ ✅ {} ｜ ⏭️ {} ｜ ❌ {}".format(
+        now_local(), n_ok, n_skip, n_bad)]
+    bits = ["▪️ " + account_label()]
+    need_manual = False
+    if ok:
+        bits.append("✅ 已續期" + (f" → {exp}" if exp else ""))
+    elif bad:
+        # 失敗：保留「邊種失敗 + 原因」，原因截短至 60 字
+        head = status.lstrip("❌").strip(" :：")
+        detail = " ".join((error or extra or "").split())
+        bits.append("❌ " + clip_text(f"{head}: {detail}" if detail else head, 60))
+        need_manual = True
     else:
-        masked_email = EMAIL[:2] + '****' 
-    
-    _acct = f" {ACCOUNT_LABEL}" if ACCOUNT_LABEL else ""
-    lines = [
-        f"🇫🇮 Bot-hosting{_acct} 续期通知",
-        "",
-        f"{status}",
-        f"👤 登录账户: {masked_email}",
-    ]
-    if _LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
-    if expiry_date:
-        lines.append(f"📅 到期时间: {expiry_date}")
-    if extra:
-        lines.append(extra)
-    if error:
-        lines.append(f"⚠️ 错误信息: {error}")
-    lines.append(f"⏱️ 登录时间: {now}")
+        # 未可續：原因 ≤ 12 字，有到期時間就跟埋
+        m = re.search(r"(\S+?)\s*后", extra or "")
+        if "手动" in (extra or "") or "未知" in (extra or ""):
+            reason, need_manual = "狀態未知", True
+        elif m:
+            reason = f"{m.group(1)} 後可續"
+        elif extra:
+            # 原因 ≤ 12 字：先剪走括號補充，避免巢狀括號
+            reason = clip_text(extra.lstrip("⏱️ ").strip().split("（")[0], 12)
+        else:
+            reason = clip_text(status.lstrip("⏳ℹ️ ").strip(), 12)
+        bits.append(f"⏭️ 未可續（{reason}）" + (f" · 到期 {exp}" if exp else ""))
+    lines.append(" · ".join(bits))
+    if need_manual:
+        lines.append("⚠️ 睇 workflow log 排查")
     return "\n".join(lines)
 
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
