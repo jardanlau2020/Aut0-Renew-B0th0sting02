@@ -140,43 +140,33 @@ def account_label() -> str:
 
 
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
-    """瘦身兩行格式：
-    表頭「🎮 服務 ｜ MM-DD HH:MM ｜ ✅ n ｜ ⏭️ n ｜ ❌ n」＋ 「▪️ 帳號 · 短狀態 · 關鍵數字」。
-    成功只留結果與到期時間；失敗保留原因（截短 60 字）；需要人手介入才加提示行。
-    """
+    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
+    name = f"Bot-hosting（{account_label()}）" if account_label() != "帳號" else "Bot-hosting"
     ok = status.startswith("✅")
     bad = status.startswith("❌")
-    n_ok, n_skip, n_bad = (1, 0, 0) if ok else ((0, 0, 1) if bad else (0, 1, 0))
     exp = fmt_expiry(expiry_date)
-    lines = ["🎮 Bot-hosting 續期 ｜ {} ｜ ✅ {} ｜ ⏭️ {} ｜ ❌ {}".format(
-        now_local(), n_ok, n_skip, n_bad)]
-    bits = ["▪️ " + account_label()]
-    need_manual = False
+
     if ok:
-        bits.append("✅ 已續期" + (f" → {exp}" if exp else ""))
+        l1 = f"✅ {name} · 成功續期" + (f"至 {exp}" if exp else "")
+        l2 = "ℹ️ 服務已自動展期"
+        return f"{l1}\n{l2}"
     elif bad:
-        # 失敗：保留「邊種失敗 + 原因」，原因截短至 60 字
         head = status.lstrip("❌").strip(" :：")
         detail = " ".join((error or extra or "").split())
-        bits.append("❌ " + clip_text(f"{head}: {detail}" if detail else head, 60))
-        need_manual = True
+        reason = clip_text(f"{head}: {detail}" if detail else head, 60)
+        l1 = f"🚨 {name} · 續期未完成"
+        l2 = f"⚠️ {reason} · 請登入面板手動處理"
+        return f"{l1}\n{l2}"
     else:
-        # 未可續：原因 ≤ 12 字，有到期時間就跟埋
+        l1 = f"🟢 {name} · 狀態良好"
         m = re.search(r"(\S+?)\s*后", extra or "")
-        if "手动" in (extra or "") or "未知" in (extra or ""):
-            reason, need_manual = "狀態未知", True
-        elif m:
-            reason = f"{m.group(1)} 後可續"
-        elif extra:
-            # 原因 ≤ 12 字：先剪走括號補充，避免巢狀括號
-            reason = clip_text(extra.lstrip("⏱️ ").strip().split("（")[0], 12)
-        else:
-            reason = clip_text(status.lstrip("⏳ℹ️ ").strip(), 12)
-        bits.append(f"⏭️ 未可續（{reason}）" + (f" · 到期 {exp}" if exp else ""))
-    lines.append(" · ".join(bits))
-    if need_manual:
-        lines.append("⚠️ 睇 workflow log 排查")
-    return "\n".join(lines)
+        window_str = f"續期窗口將於 {m.group(1)} 後開啟" if m else "未到續期窗口"
+        info_parts = []
+        if exp:
+            info_parts.append(f"{exp} 到期")
+        info_parts.append(window_str)
+        l2 = "ℹ️ " + " · ".join(info_parts)
+        return f"{l1}\n{l2}"
 
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
 def _turnstile_iframe_present(sb) -> bool:
