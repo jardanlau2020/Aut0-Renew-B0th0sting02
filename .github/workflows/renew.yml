@@ -5,37 +5,46 @@ on:
     - cron: '20 1 * * *' # 每日 UTC 01:20 = 北京时间 09:20
       # 原 0 点整：GitHub schedule 排队高峰常有数小时延迟（实测迟过 4h47m），错开减少延迟。
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run（照登录/读状态，但不回写 SESSION_TOKEN 到 Secret）'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   Renew-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Turnstile 最长等 240s + 后台确认轮询 90s + 整页重载，比默认 360 分钟小得多，
+    # 但设个上限，免得卡死后白占 runner 直到超时。
+    concurrency:
+      group: aut0-renew-bot-hosting
+      cancel-in-progress: false
     permissions:
-      actions: write
+      actions: write   # 末尾「清理旧 run 记录」要删 run，必须 write
       contents: read
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: ⚙ 设置 Python
-        uses: actions/setup-python@v7
+      - name: 🔄 运行续期脚本（renew-kit）
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.4.2
         with:
-          python-version: '3.12'
-
-      - name: 🛠️ 安装系统依赖和 Python 依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install seleniumbase requests
-          seleniumbase install chromedriver
-
-      - name: ⚙ 设置代理 (sing-box)
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
-      - name: 🚀 运行续期脚本
+          script: app.py
+          python-version: "3.12"
+          renewkit-ref: v0.4.2
+          apt-packages: "xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget"
+          pip-packages: "seleniumbase requests"
+          # 多行：chromedriver 装失败也不挡代理（action 的 setup step 是
+          # set -uo pipefail 无 -e，且默认 continue-on-error）。
+          setup-command: |
+            seleniumbase install chromedriver
+            bash scripts/setup_proxy.sh
+          command: 'xvfb-run --auto-servernum python3 app.py'
+          artifact-paths: "*.png"
+          artifact-name: bot-hosting-screenshots-02
+          notify-on-failure: "true"
         env:
           EMAIL: ${{ secrets.EMAIL }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -44,18 +53,8 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_LABEL: "02"
-        run: |
-          xvfb-run --auto-servernum python3 app.py
-
-      - name: 📤 上传截图证据
-        # 失败路径会保存 *.png 诊断截图，没有这一步全部丢失，事后无从回看现场。
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: bot-hosting-screenshots-02
-          path: '*.png'
-          if-no-files-found: ignore
-          retention-days: 14
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
 
       - name: 🧽 清理进程和临时文件
         if: always()

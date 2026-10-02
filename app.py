@@ -1,29 +1,77 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Bot-hosting（bot-hosting.net）自动续期 —— 已迁移到 renew-kit v0.4.2。
 
-import os, re, sys, time, json, requests, subprocess
+迁移要点（与原版的差异，逐条对照）：
+
+1. 退出码从 1 / 2 / 5 / 4 / 4 / 3|6 收敛成 0/1 —— 只有「确定性业务失败」才 1。
+     ✅ 续期成功            → RENEWED   → 0
+     ⏳ 未到续期时间        → SKIPPED   → 0（且静默，见第 3 点）
+     ℹ️ 无需续期（读不到）  → UNKNOWN   → 0（会通知，但不标红）
+     ❌ 登录失败 / 续期失败 / 脚本异常中断 → FAILED → 1
+
+2. 通知改由 renewkit.report.RenewReport 统一渲染。原版 hand-roll 的
+   send_telegram_message / format_notification / now_local / clip_text /
+   fmt_expiry / masked_email / account_label 全部删除，改由 TargetResult
+   的 lines() 出稿。TG 凭据由 renewkit.notify.config() 自读
+   （TG_BOT_TOKEN / TG_CHAT_ID，或 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 别名），
+   少一个就静默跳过通知 —— 通知挂了绝不把续期判成失败。
+   代价一处：RENEWED 分支不渲染 detail，所以「可续期倒计时」那句没了；
+   成功行本身已带「续期至 MM-DD」+「剩余 N 天」，信息不丢。
+
+3. 「未到续期时间」判 SKIPPED → **静默**（QUIET_OUTCOMES）。
+   原版每天都发一条「🟢 状态良好」心跳，但 bot-hosting 是 4 日续期而 cron
+   是每日 —— 每 4 次运行里 3 次纯噪音。默认只在这三种情况出声：
+   真续成功（✅）/ 真失败（🚨）/ 状态读不到（❓）。
+   想要回心跳：给 workflow 加 AUT0_NOTIFY_SKIP: '1' 即可，不用改代码。
+
+4. 一处**有意保留的偏离**：「已點擊但後台未確認」（原 fail_code=3）仍判
+   FAILED（红 + 通知），没有收敛成 UNKNOWN。原因：原作者在此处留了明确
+   注释 ——「不能只发警告后 return 0，否则 Actions 会显示 success」。
+   bot-hosting 漏续会删号，宁可红不可绿；UNKNOWN 会退成绿色，与作者意图相反。
+
+5. 状态字符串（"✅ 续期成功" / "⏳ 未到续期时间" / "❌ 登录失败" …）保留为
+   **内部协议**。第 171–793 行整段（Turnstile 五合一偵測、shadow DOM 递归
+   探测 token、按钮解锁轮询、OneTrust 弹窗、Discord OAuth）逻辑一个字节
+   没动，只把里面几处 os.environ 读法换成等价的 renewkit.env；映射成
+   Outcome 只发生在报告边界（_outcome_of）。迁移的风险面就只有文件头和 main()。
+
+   一处变量命名注意：报告名变量故意叫 target 而不是 name —— 正文里注入
+   cookie 那段是 `for name, value in COOKIES.items()`，叫 name 会被覆盖成
+   最后一个 cookie key（"theme"），整个报告的目标名就全错了。
+
+6. 代理（IS_PROXY / PROXY_SERVER）仍由上游 setup_proxy.sh 写进 GITHUB_ENV，
+   app.py 只读不写 —— 与原版一致。
+
+7. 新增 DRY_RUN 支持（workflow_dispatch 的 dry_run 输入）：只挡「回写
+   SESSION_TOKEN 到 GitHub Secret」这一件有副作用的事，登录/读 cookie/读
+   状态照跑。原版没有演练开关，手动跑一次就会动真实 Secret。
+"""
+
+import os, re, sys, time, json, requests, subprocess, traceback
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime
 from seleniumbase import SB
 
-# 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 邮箱,只用于通知使用，可随意填写
-SESSION_TOKEN = os.environ.get("SESSION_TOKEN") or ""   # session token，默认登录方式,非必须
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID") or ""      # TG chat id,不填写不通知，需和bot token一起填写生效
-TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG bot token 
-ACCOUNT_LABEL = os.environ.get("ACCOUNT_LABEL") or ""   # 帳號標識（如 "01"/"02"），通知用嚟區分多個帳號
+from renewkit import env
+from renewkit.outcome import Outcome
+from renewkit.report import RenewReport, shorten
 
-# 解析 DISCORD_TOKEN
+# 环境变量配置（模块级读取，strip 语义与 renewkit.env.get 一致）
+EMAIL         = env.get("EMAIL")           # 邮箱，只用于通知（遮罩后进报告名），可随意填写
+SESSION_TOKEN = env.get("SESSION_TOKEN")   # session token，默认登录方式
+DISCORD_TOKEN = env.get("DISCORD_TOKEN")   # Discord Token 备用登录方式，SESSION_TOKEN 失败时才用
+GH_TOKEN      = env.get("GH_TOKEN")        # GitHub PAT，用于自动回写 SESSION_TOKEN，可选
+ACCOUNT_LABEL = env.get("ACCOUNT_LABEL")   # 帳號標識（"01"/"02"），通知用嚟區分多個帳號
+
+# TG 凭据不再在这里读 —— renewkit.notify.config() 自己认 TG_BOT_TOKEN / TG_CHAT_ID
+# （或 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 别名），少一个就静默跳过通知。
+
+# 解析 DISCORD_TOKEN（兼容 "label,token" 两段式写法）
 DC_TOKEN = ""
 if DISCORD_TOKEN:
     _parts = DISCORD_TOKEN.split(",", 1)
     DC_TOKEN = _parts[-1].strip()
-
-if not SESSION_TOKEN and not DC_TOKEN:
-    print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN,脚本终止。")
-    sys.exit(1)
 
 # 构造cookie
 COOKIES = {
@@ -32,7 +80,7 @@ COOKIES = {
     "theme": "system",
 }
 
-# 记录本次登录方式（用于通知）
+# 记录本次登录方式（用于日志）
 _LOGIN_METHOD = "SESSION_TOKEN"
 
 # 获取cookie到期时间
@@ -83,90 +131,85 @@ def update_github_secret(secret_name, new_value):
         print(f"❌ 异常: {e}")
         return False
 
-# 发送tg通知
-def send_telegram_message(message: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
-        if r.status_code == 200 and r.json().get("ok"):
-            print("✅ Telegram 通知已发送")
-        else:
-            print(f"❌ Telegram 返回 {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+# ══════════════════════ renew-kit 报告边界 ══════════════════════
+# 下面这层是把内部状态字符串翻译成 renewkit 语义的**唯一**地方。
+# 往下的浏览器逻辑只管返回中文状态串，不认 Outcome。
+SERVICE = "Bot-hosting"
 
-# 通知格式（瘦身版：表頭一行 + 帳號一行，純文本無 HTML 標籤）
-def now_local() -> str:
-    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
-    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+#: 静默的 Outcome —— 正常/无事可做时不发 TG。
+QUIET_OUTCOMES = frozenset({Outcome.SKIPPED, Outcome.ALREADY_MAX, Outcome.TRANSIENT})
+
+#: 「已达续期上限」的文本特征；命中判 ALREADY_MAX 而不是普通 SKIPPED。
+_ALREADY_MAX_HINTS = ("已达续期上限", "renew limit", "limit reached", "上限")
+
+#: 详情串截断长度（renewkit 不截 detail，长串会把 TG 那一行撑爆）。
+_DETAIL_LIMIT = 100
+
+_RE_ANY_DATE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})")
 
 
-def clip_text(text, limit: int) -> str:
-    """壓平空白並截短（超出用 … 收尾），避免通知爆行"""
-    s = " ".join(str(text or "").split())
-    return s if len(s) <= limit else s[:limit - 1] + "…"
+def _norm_expiry(value) -> str:
+    """把面板到期日期归一成 renewkit 认得的 ``YYYY-MM-DD``。
+
+    extract_expiry_date() 吐的是**斜杠**格式（"2026/07/07"），而 renewkit 的
+    _ISO_RE 只认连字符 —— 不归一的话 format_expiry 会把 "2026/07/07" 原样
+    印出来，days_left 直接返回 None，「剩 N 天」整段消失。
+    认不出的值（"（未获取到）" 之类哨兵）一律回空串，不让脏串进报告。
+    """
+    m = _RE_ANY_DATE.match(str(value or "").strip())
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
 
-def fmt_expiry(value) -> str:
-    """到期日期 → MM-DD HH:MM 或 MM-DD（兼容 / 與 - 分隔；攞唔到回空字串）"""
-    t = str(value or "").strip()
-    if not t:
-        return ""
-    m = re.match(r"(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2})", t)
-    if m:
-        return f"{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}"
-    m = re.match(r"(\d{4})[-/](\d{2})[-/](\d{2})", t)
-    if m:
-        return f"{m.group(2)}-{m.group(3)}"
-    return ""
+def _masked_email() -> str:
+    """EMAIL 遮罩（原 masked_email 的等价物，改成读 renewkit.env）。"""
+    email = env.get("EMAIL")
+    if "@" in email:
+        name, domain = email.split("@", 1)
+        return f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
+    return (email[:2] + "****") if email else ""
 
 
-def masked_email() -> str:
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            return f"{name[:2]}****{name[-2:]}@{domain}"
-        return f"{name}@{domain}"
-    return (EMAIL[:2] + '****') if EMAIL else ""
+def _target_name() -> str:
+    """报告里的目标名：ACCOUNT_LABEL（workflow 传 "01"/"02"）优先，退而用遮罩邮箱。"""
+    parts = [p for p in (env.get("ACCOUNT_LABEL").strip(), _masked_email()) if p]
+    return f"Bot-hosting（{' '.join(parts)}）" if parts else "Bot-hosting"
 
 
-def account_label() -> str:
-    """通知用嘅帳號標識：ACCOUNT_LABEL 優先，補埋遮罩郵箱"""
-    parts = [p for p in (ACCOUNT_LABEL.strip(), masked_email()) if p]
-    return " ".join(parts) or "帳號"
+def _outcome_of(status: str, detail: str = "") -> Outcome:
+    """内部状态串 → Outcome。**只有 ❌ 开头算真失败**（会让 job 标红）。"""
+    s = (status or "").strip()
+    if s.startswith("✅"):
+        return Outcome.RENEWED
+    if s.startswith("❌"):
+        return Outcome.FAILED
+    if s.startswith("ℹ️"):          # 「无需续期」= 连按钮/倒计时都读唔到，状态未知
+        return Outcome.UNKNOWN
+    if s.startswith("⏳") or s.startswith("⏭️"):
+        blob = f"{s} {detail or ''}".lower()
+        if any(h.lower() in blob for h in _ALREADY_MAX_HINTS):
+            return Outcome.ALREADY_MAX
+        return Outcome.SKIPPED
+    if s.startswith("⚠️") or s.startswith("⏰"):
+        return Outcome.UNKNOWN
+    return Outcome.FAILED
 
 
-def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
-    """方案 B (極致精簡人話版): 每台精準兩行，徹底消滅頂部計數器"""
-    name = f"Bot-hosting（{account_label()}）" if account_label() != "帳號" else "Bot-hosting"
-    ok = status.startswith("✅")
-    bad = status.startswith("❌")
-    exp = fmt_expiry(expiry_date)
+def _record(report, target, status, *, extra="", error="", expiry="") -> None:
+    """把一次结果落到报告里 —— 所有 report.add 都走这里，口径唯一。
 
-    if ok:
-        l1 = f"✅ {name} · 成功續期" + (f"至 {exp}" if exp else "")
-        l2 = "ℹ️ 服務已自動展期"
-        return f"{l1}\n{l2}"
-    elif bad:
-        head = status.lstrip("❌").strip(" :：")
-        detail = " ".join((error or extra or "").split())
-        reason = clip_text(f"{head}: {detail}" if detail else head, 60)
-        l1 = f"🚨 {name} · 續期未完成"
-        l2 = f"⚠️ {reason} · 請登入面板手動處理"
-        return f"{l1}\n{l2}"
-    else:
-        l1 = f"🟢 {name} · 狀態良好"
-        m = re.search(r"(\S+?)\s*后", extra or "")
-        window_str = f"續期窗口將於 {m.group(1)} 後開啟" if m else "未到續期窗口"
-        info_parts = []
-        if exp:
-            info_parts.append(f"{exp} 到期")
-        info_parts.append(window_str)
-        l2 = "ℹ️ " + " · ".join(info_parts)
-        return f"{l1}\n{l2}"
+    ❌ 开头时把状态里「❌」后面的词当小标题拼进 detail（原 format_notification
+    的 ``reason = f"{head}: {detail}"`` 行为），否则「脚本异常中断」这种状态
+    词就丢了。error 与 extra 只拼非空的那个；两者都空时退回小标题本身，
+    免得通知里只剩 renewkit 的兜底文案「执行失败」。
+    """
+    s = (status or "").strip()
+    body = str(error or extra or "")
+    if s.startswith("❌"):
+        head = s.lstrip("❌").strip(" :：")
+        body = f"{head}: {body}" if body else head
+    detail = shorten(" ".join(body.split()), _DETAIL_LIMIT)
+    report.add(target, _outcome_of(s, detail),
+               expire=_norm_expiry(expiry), detail=detail)
 
 # 检查页面是否存在 Turnstile iframe（无隐式等待）
 def _turnstile_iframe_present(sb) -> bool:
@@ -191,7 +234,7 @@ def _turnstile_iframe_present(sb) -> bool:
 
 
 # X11 環境（GHA 用 xvfb-run 跑，有 DISPLAY）才有 uc_gui_click_captcha 可用
-IS_X11 = bool(os.environ.get("DISPLAY"))
+IS_X11 = bool(env.get("DISPLAY"))
 
 
 # Turnstile 已解決的鐵證：cf-turnstile-response input 存在且 value 非空。
@@ -711,8 +754,8 @@ def discord_authorize(state: str) -> str:
 
     # 如果配置了代理，Discord API 请求也走代理
     proxies = None
-    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    _is_proxy = env.get("IS_PROXY").lower() == "true"
+    _proxy_server = env.get("PROXY_SERVER") or "http://127.0.0.1:1080"
     if _is_proxy:
         proxies = {"http": _proxy_server, "https": _proxy_server}
 
@@ -793,14 +836,28 @@ def do_discord_login(sb) -> bool:
 
 
 # 主流程
-def main():
-    print("#" * 25)
-    print("   Bot-hosting 自动续期")
-    print("#" * 25)
+def run_all() -> RenewReport:
+    """跑一轮续期，把结果收进 RenewReport。
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+    所有出口都是 ``return report``（原来散落的 sys.exit(1/2/4/5/3|6) 已收敛），
+    退出码由 RenewReport.exit_code 统一决定：只有 FAILED 才是 1。
+    """
+    report = RenewReport(service=SERVICE)
+    # ⚠️ 变量名故意不叫 name：下面注入 cookie 那段有
+    #    `for name, value in COOKIES.items()`，会把 name 覆盖成最后一个 key
+    #    （"theme"），报告名就会全变成「theme」。改叫 target 把这个坑堵死。
+    target = _target_name()
+
+    if not SESSION_TOKEN and not DC_TOKEN:
+        # 原版在模块顶层直接 sys.exit(1)：既没通知也没报告，日志只有一行 print。
+        # 现在走 FAILED → 会通知 + 标红，诊断信息完整。
+        _record(report, target, "❌ 登录失败",
+                error="未配置 SESSION_TOKEN 和 DISCORD_TOKEN，无法登录")
+        return report
+
+    IS_PROXY = env.get("IS_PROXY").lower() == "true"
+    PROXY_SERVER = env.get("PROXY_SERVER") or "http://127.0.0.1:1080"
+    HEADLESS = env.get("HEADLESS").lower() == "true"
 
     sb_kwargs = {"uc": True, "headless": HEADLESS}
 
@@ -891,8 +948,8 @@ def main():
                 elif SESSION_TOKEN and DC_TOKEN:
                     error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
                 sb.save_screenshot("login_failed.png")
-                send_telegram_message(format_notification("❌ 登录失败", error=error_msg))
-                sys.exit(2)
+                _record(report, target, "❌ 登录失败", error=error_msg)
+                return report
 
             if _LOGIN_METHOD == "Discord Token":
                 print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
@@ -952,8 +1009,9 @@ def main():
                 except Exception as e:
                     print(f"❌ 点击外部按钮失败: {e}")
                     sb.save_screenshot("click_outer_failed.png")
-                    send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
-                    sys.exit(5)
+                    _record(report, target, "❌ 续期失败",
+                            error=f"点击外部续期按钮出错（{e}）")
+                    return report
 
                 # 处理弹窗中的 Turnstile
                 print("🔒 检测弹窗中的 Turnstile 验证...")
@@ -965,8 +1023,8 @@ def main():
                 if not turnstile_passed:
                     print("❌ Turnstile 验证最终未通过，脚本退出")
                     sb.save_screenshot("turnstile_final_fail.png")
-                    send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
-                    sys.exit(4)
+                    _record(report, target, "❌ 续期失败", error="Turnstile 验证未通过")
+                    return report
 
                 # 点击续期按钮
                 print("⏳ 等待弹窗续期按钮可用并点击...")
@@ -992,9 +1050,9 @@ def main():
                     print("❌ 续期按钮仍处于锁定状态（bot check 未通过），放弃点击")
                     _dump_popup_dom(sb)
                     sb.save_screenshot("button_still_locked.png")
-                    send_telegram_message(format_notification(
-                        "❌ 续期失败", error="Bot check 未通过，按钮仍锁定"))
-                    sys.exit(4)
+                    _record(report, target, "❌ 续期失败",
+                            error="Bot check 未通过，按钮仍锁定")
+                    return report
                 print("✅ 撳掣前確認：按鈕已解鎖（bot check 已通過）")
                 try:
                     sb.wait_for_element_visible('button:contains("Renew for 4 days")', timeout=15)
@@ -1089,16 +1147,14 @@ def main():
                         print(f"⏱️ 新的倒计时: {new_countdown}")
                     if new_expiry:
                         print(f"📅 新的到期日期: {new_expiry}")
-                    send_telegram_message(
-                        format_notification(
-                            "✅ 续期成功",
-                            extra=(f"⏱️ 可续期时间: {format_countdown(new_countdown)}后"
-                                   if new_countdown else "到期日期已确认更新"),
-                            expiry_date=new_expiry or "（未获取到）"
-                        )
+                    _record(
+                        report, target, "✅ 续期成功",
+                        extra=(f"可续期时间: {format_countdown(new_countdown)}后"
+                               if new_countdown else "到期日期已确认更新"),
+                        expiry=new_expiry or current_expiry,
                     )
                 else:
-                    # 关键修复：不能只发警告后 return 0，否则 Actions 会显示 success。
+                    # 关键：不能只发警告后 return，否则 Actions 会显示 success。
                     print("❌ 续期未能确认：到期日期/成功提示均未变化")
                     sb.save_screenshot("renew_result_unknown.png")
                     # 如实区分：到底点没点到按钮，不能再笼统说“已点击”
@@ -1106,37 +1162,27 @@ def main():
                         extra = (f"按钮已点击但后台未确认"
                                  f"（{current_expiry or '?'} → {new_expiry or '?'}），"
                                  f"可能续得太早被拒，明日窗口临近会自动重试")
-                        fail_code = 3
                     else:
                         extra = (f"弹窗内「Renew for 4 days」按钮没点着"
                                  f"（{click_error or '未知原因'}），需人工检查")
-                        fail_code = 6
                     if toast_hint:
                         extra += f"；页面提示: {toast_hint}"
                     if new_countdown:
                         extra += f"；按钮已转入倒计时 {new_countdown}"
-                    send_telegram_message(
-                        format_notification(
-                            "❌ 续期失败",
-                            extra=extra,
-                            expiry_date=new_expiry or current_expiry or "（未获取到）"
-                        )
-                    )
-                    # sys.exit 抛 SystemExit（不是 Exception），不会被外层 try/except 吞掉，
-                    # 退出码让 Actions 直接标红，不再假报 success。
-                    sys.exit(fail_code)
+                    # 原版这里 sys.exit(3 或 6)：已点击未确认 / 按钮没点着。
+                    # 收敛后两者都是 FAILED → exit 1，Actions 一样标红；区别落在
+                    # detail 文字里（见文件头第 4 点：这是有意保留的偏离）。
+                    _record(report, target, "❌ 续期失败", extra=extra,
+                            expiry=new_expiry or current_expiry)
+                    return report
 
             else:
                 if countdown_text:
                     friendly = format_countdown(countdown_text)
                     print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
-                    send_telegram_message(
-                        format_notification(
-                            "⏳ 未到续期时间",
-                            extra=f"⏱️ 可续期时间: {friendly}后",
-                            expiry_date=current_expiry or "（未获取到）"
-                        )
-                    )
+                    _record(report, target, "⏳ 未到续期时间",
+                            extra=f"可续期时间: {friendly}后",
+                            expiry=current_expiry)
                 else:
                     # 兜底：從 page source 直接提取倒數（02 run#13 實證：續完後掣會轉做
                     # 倒數計時器，selector get_text 可能 miss —— 唔好直接判「狀態未知」）
@@ -1146,22 +1192,14 @@ def main():
                         countdown_text = m.group(1)
                         friendly = format_countdown(countdown_text)
                         print(f"⏳ 未到续期时间（兜底提取），倒计时: {countdown_text} ({friendly})")
-                        send_telegram_message(
-                            format_notification(
-                                "⏳ 未到续期时间",
-                                extra=f"⏱️ 可续期时间: {friendly}后",
-                                expiry_date=current_expiry or "（未获取到）"
-                            )
-                        )
+                        _record(report, target, "⏳ 未到续期时间",
+                                extra=f"可续期时间: {friendly}后",
+                                expiry=current_expiry)
                     else:
                         print("ℹ️ 未找到续期按钮或倒计时，状态未知")
-                        send_telegram_message(
-                            format_notification(
-                                "ℹ️ 无需续期",
-                                extra="当前状态未知，请手动检查",
-                                expiry_date=current_expiry or "（未获取到）"
-                            )
-                        )
+                        _record(report, target, "ℹ️ 无需续期",
+                                extra="未找到续期按钮或倒计时，状态未知",
+                                expiry=current_expiry)
 
             # 更新SESSION_TOKEN 
             print("🔄 检查 SESSION_TOKEN 是否需要更新")
@@ -1170,7 +1208,11 @@ def main():
 
             if should_update_cookie(new_token, old_token, token_expiry):
                 print("🔄 SESSION_TOKEN 需要更新")
-                if GH_TOKEN:
+                if env.dry_run():
+                    # DRY_RUN 只挡「写真实 Secret」这一件有副作用的事：演练时
+                    # 照样登录、照样读 cookie，但不把新 token 推上 GitHub。
+                    print(f"ℹ️ DRY_RUN 演练，跳过回写 Secret（新值 {new_token[:4]}...{new_token[-4:]}）")
+                elif GH_TOKEN:
                     if update_github_secret("SESSION_TOKEN", new_token):
                         print("✅ SESSION_TOKEN 更新成功")
                     else:
@@ -1185,16 +1227,33 @@ def main():
     except Exception as e:
         # 原代码这个 try 没有 except，Selenium 一崩就直接抛栈退出：
         # 没截图、没通知，日志只剩一截 traceback，等于零诊断信息。
-        import traceback
         traceback.print_exc()
         try:
             sb.save_screenshot("fatal_error.png")
         except Exception:
             pass
-        send_telegram_message(
-            format_notification("❌ 脚本异常中断", error=str(e)[:300])
-        )
-        sys.exit(1)
+        _record(report, target, "❌ 脚本异常中断", error=f"{type(e).__name__}: {e}")
+    return report
+
+
+def main() -> int:
+    print("#" * 25)
+    print("   Bot-hosting 自动续期")
+    print("#" * 25)
+
+    try:
+        report = run_all()
+    except Exception as exc:            # run_all 内部已兜底；这里防的是它自己出意外
+        traceback.print_exc()
+        report = RenewReport(service=SERVICE)
+        report.add(_target_name(), Outcome.FAILED,
+                   detail=f"{type(exc).__name__}: {shorten(str(exc), 200)}")
+
+    # 默认静默 SKIPPED（见文件头第 3 点）；AUT0_NOTIFY_SKIP=1 恢复每日心跳。
+    notify_tg = env.dry_run("AUT0_NOTIFY_SKIP") or any(
+        r.outcome not in QUIET_OUTCOMES for r in report.results)
+    return report.finish(notify_tg=notify_tg)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

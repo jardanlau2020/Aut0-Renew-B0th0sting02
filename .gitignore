@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# 失败诊断截图：CI 里由 upload-artifact 收走，不进版本库
+*.png
