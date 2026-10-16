@@ -966,6 +966,8 @@ def run_all() -> RenewReport:
             # 寻找外部续期按钮
             outer_renew_selector = None
             countdown_text = None
+            cooldown_selector = None
+            cooldown_left = ""
             possible_selectors = [
                 'button:contains("Renew")',
                 'button:contains("Renew free plan")',
@@ -983,12 +985,44 @@ def run_all() -> RenewReport:
                             if match:
                                 countdown_text = match.group(1)
                             break
+                        elif re.search(r"cooldown", button_text, re.I):
+                            # 2026-10-16：站方新增「Renewal cooldown HH:MM:SS」狀態 —— 掣未可撳
+                            # （唔係「Renew in」倒數）。舊碼當佢「可用」→ 撳空氣 → 彈窗唔開 →
+                            # 盲撳 42 次 → 誤報「Turnstile 未通過」紅單
+                            # （run 38858394102 / 38858300980，兩個帳號同款）。
+                            m = re.search(r"(\d{2}:\d{2}:\d{2})", button_text)
+                            cooldown_left = m.group(1) if m else ""
+                            cooldown_selector = selector
+                            print(f"⏳ 掣處於冷卻（未可續期）: '{button_text}'")
+                            break
                         elif "Renew" in button_text and "in" not in button_text.lower():
                             outer_renew_selector = selector
                             print(f"✅ 续期按钮可用: '{button_text}'")
                             break
                 except Exception as e:
                     pass
+
+            # 冷卻期（2026-10-16 新增）：掣顯示「Renewal cooldown HH:MM:SS」時，
+            # 站方唔受理。短冷卻（幾分鐘）值得等一等再撳；等唔到就當「未到續期時間」，
+            # 唔應該標紅。
+            if cooldown_selector and not outer_renew_selector:
+                _deadline = time.time() + 300
+                while time.time() < _deadline:
+                    sb.sleep(20)
+                    try:
+                        _txt = sb.get_text(cooldown_selector)
+                    except Exception:
+                        break
+                    if re.search(r"cooldown", _txt, re.I):
+                        print(f"   ⏳ 仍然冷卻: '{_txt}'")
+                        continue
+                    if "Renew in" in _txt:
+                        _m = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", _txt)
+                        countdown_text = _m.group(1) if _m else countdown_text
+                        break
+                    outer_renew_selector = cooldown_selector
+                    print(f"   ✅ 冷卻結束，掣可用: '{_txt}'")
+                    break
 
             # 点击外部续期按钮等待弹窗
             if outer_renew_selector:
@@ -1018,9 +1052,29 @@ def run_all() -> RenewReport:
                 _dump_popup_dom(sb)  # run#22 教訓：留低彈窗現場結構，方便對症落藥
                 # 舊邏輯「先 uc_gui_click_captcha() 再判」打唔中就純粹靠運氣（run#31/32 實證）；
                 # v2 已內建「剷 OneTrust 彈窗 → 撳 captcha → 等 token」重試，直接調用即可。
+                # 2026-10-16：撳完外層掣之後，先確認彈窗有冇開。連 widget 同掣都冇
+                # （_renew_button_state == "missing"）就係「彈窗根本冇開」—— 唔應該照跑
+                # 240 秒盲撳再誤報「Turnstile 未通過」（run 38858394102/38858300980 實證）。
+                _modal_open = (_turnstile_iframe_present(sb) or _turnstile_widget_present(sb)
+                               or _renew_button_state(sb) != "missing")
+                if not _modal_open:
+                    print("⚠️ 彈窗未開（冇 widget、冇續期掣）→ 唔當 Turnstile 失敗")
+                    sb.save_screenshot("modal_not_open.png")
+                    _record(report, target, "⏳ 未到续期时间",
+                            extra=(f"掣顯示冷卻 {cooldown_left}" if cooldown_left
+                                   else "彈窗未開（可能站方抽風），下次自動重試"))
+                    return report
+
                 turnstile_passed = wait_for_turnstile_pass(sb, timeout=240)
 
                 if not turnstile_passed:
+                    if _renew_button_state(sb) == "missing":
+                        # 等完 240 秒都冇彈窗 —— 同上，判「未到續期時間」而唔係標紅
+                        print("⚠️ 等完仍然冇彈窗 → 判『未到續期時間』，唔標紅")
+                        sb.save_screenshot("modal_not_open.png")
+                        _record(report, target, "⏳ 未到续期时间",
+                                extra="彈窗未開（可能冷卻／站方抽風），下次自動重試")
+                        return report
                     print("❌ Turnstile 验证最终未通过，脚本退出")
                     sb.save_screenshot("turnstile_final_fail.png")
                     _record(report, target, "❌ 续期失败", error="Turnstile 验证未通过")
@@ -1072,9 +1126,15 @@ def run_all() -> RenewReport:
                     sb.save_screenshot("modal_confirm_failed.png")
                     # JS 兜底：选择器点不动（被遮罩挡住/按钮被重渲染）时直接 DOM 派发 click
                     try:
+                        # 2026-10-16：站方按鈕文案會變（上游同日改成 button[type="button"]，
+                        # 但咁太闊易撳錯）。改為喺**彈窗範圍內**搵 /renew/i 而未被 disable 嘅掣。
                         clicked = sb.execute_script(
-                            "for (const b of document.querySelectorAll('button')) {"
-                            " if (b.textContent.includes('Renew for 4 days')) { b.click(); return true; }"
+                            "const scopes = document.querySelectorAll('.modal.show,.modal,[role=dialog],body');"
+                            " for (const sc of scopes) {"
+                            "  for (const b of sc.querySelectorAll('button')) {"
+                            "   const t = (b.textContent || '').trim();"
+                            "   if (/renew/i.test(t) && !b.disabled) { b.click(); return true; }"
+                            "  }"
                             " } return false;"
                         )
                         if clicked:
