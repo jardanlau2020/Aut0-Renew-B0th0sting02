@@ -1,0 +1,21 @@
+name: Probe Email Login (one-off)
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: install
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: probe
+        env:
+          EMAIL_A: ${{ secrets.EMAIL_A }}
+          PASS_A: ${{ secrets.PASS_A }}
+          EMAIL_B: ${{ secrets.EMAIL_B }}
+          PASS_B: ${{ secrets.PASS_B }}
+        run: python probe_login.py
