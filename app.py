@@ -1013,7 +1013,17 @@ def run_all() -> RenewReport:
                 if cooldown_left:
                     try:
                         _h, _mi, _se = [int(x) for x in cooldown_left.split(":")]
-                        _cap = min(max(300, _h * 3600 + _mi * 60 + _se + 60), 20 * 60)
+                        _cd_s = _h * 3600 + _mi * 60 + _se
+                        # 2026-10-29 加：冷卻可以長達 22 小時（實測 'Renewal cooldown 22:21:01'）。
+                        # 舊碼 cap 到 20 分鐘，結果乾等 20 分鐘先肯退出（run 40845379284
+                        # 就係咁燒咗 20 分鐘 Actions 分鐘）。超過 15 分鐘直接判「未到時間」走人。
+                        if _cd_s > 900:
+                            print(f"ℹ️ 冷卻 {cooldown_left}（>15 分鐘），唔等，留待下次排程")
+                            _record(report, target, "⏳ 冷卻中",
+                                    extra=f"站方冷卻未過（剩 {cooldown_left}），下次排程再試",
+                                    expiry=current_expiry or "")
+                            return report
+                        _cap = max(300, _cd_s + 60)
                     except Exception:
                         pass
                 print(f"   ⏳ 冷卻 {cooldown_left or '?'}，最多等 {_cap // 60} 分鐘")
