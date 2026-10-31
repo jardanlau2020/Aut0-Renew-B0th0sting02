@@ -1,6 +1,9 @@
 name: Capture Renew API (one-off)
 on:
   workflow_dispatch:
+  schedule:
+    # 一次性：2026-11-01 07:30 UTC = 北京 15:30（冷卻剛過，個掣會解鎖）
+    - cron: '30 7 1 11 *'
 jobs:
   cap:
     runs-on: ubuntu-latest
