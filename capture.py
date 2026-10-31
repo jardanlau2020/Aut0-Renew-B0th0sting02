@@ -30,11 +30,15 @@ with sync_playwright() as p:
     import re
     m=re.search(r'(?:(\d{2}:\d{2}:\d{2}) 后?可续期)', body)
     print("  ② 冷卻狀態:", m.group(1) if m else "（唔見倒數，可能可續期）")
-    print("  ③ 到期:", (re.search(r'(\d{4}/\d{2}/\d{2})\s*到期', body).group(1) if re.search(r'(\d{4}/\d{2}/\d{2})\s*到期', body) else '?'))
+    print("  ③ 到期:", ((re.search(r'(\d{4}/\d{1,2}/\d{1,2})\s*到期', body).group(1) if re.search(r'(\d{4}/\d{1,2}/\d{1,2})\s*到期', body) else '?'))
 
     # 撳 Renew free plan
+    try:
+        btns=pg.locator("button").all_inner_texts()
+        print("  ③b 頁面所有按鈕:", [b.strip()[:20] for b in btns][:8])
+    except Exception: pass
     clicked=False
-    for sel in ["button:has-text('Renew free plan')","a:has-text('Renew free plan')","text=Renew free plan"]:
+    for sel in ["button:has-text('Renew free plan')","a:has-text('Renew free plan')","button:has-text('Renew')","text=Renew free plan"]:
         try:
             el=pg.locator(sel).first
             if el.is_visible(timeout=4000):
