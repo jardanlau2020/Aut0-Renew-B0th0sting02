@@ -657,6 +657,8 @@ def format_countdown(countdown_str: str) -> str:
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
+        r"[Ee]xpires\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",   # Expires 2026-11-14（2026-11-12 新增：新版 /dash/billings）
+        r"(\d{4}-\d{2}-\d{2})\s*[\-–]?\s*renew",       # 2026-11-14 - renew
         r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",   # Expires 2026/07/07
         r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",   # Expires 07/07/2026 (MM/DD/YYYY)
         r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",        # 2026/07/07 - renew
@@ -674,6 +676,10 @@ def extract_expiry_date(page_source: str) -> str:
                     # 修正：将 MM/DD/YYYY 转为 YYYY/MM/DD
                     return f"{parts[2]}/{parts[0]}/{parts[1]}"
             return date_str
+    # 2026-11-12：抽唔到就打印候選日期，一次 run 就攞到新頁面格式
+    cands = re.findall(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}", page_source)
+    if cands:
+        print(f"🔍 到期日期候選（供修正 regex）: {cands[:8]}")
     return None
 
 #   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
