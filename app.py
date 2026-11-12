@@ -680,6 +680,10 @@ def extract_expiry_date(page_source: str) -> str:
     cands = re.findall(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}", page_source)
     if cands:
         print(f"🔍 到期日期候選（供修正 regex）: {cands[:8]}")
+        # 2026-11-12：新版 /dash/billings 用 ISO 日期且無「Expires」字樣，
+        # 頁面第一個日期就係到期日（實測 2026-11-16）。先頂住，令續期後可比對。
+        print(f"📅 改用候選第一個日期: {cands[0]}")
+        return cands[0]
     return None
 
 #   Discord OAuth 登录（SESSION_TOKEN 失效时的备用方案）
